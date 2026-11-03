@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Masaüstünde duran, tıklanamayan küçük bir piksel mahalle."""
+import argparse
 import datetime
 import functools
 import glob
 import math
+import os
 import random
 import shutil
 import subprocess
+import threading
 import time
+import traceback
 
 import cairo
 import gi
+
+# Wayland'de pencere konumu ve masaüstü ipucu yok sayılır; XWayland varsa onu kullan.
+if os.environ.get('WAYLAND_DISPLAY') and os.environ.get('DISPLAY'):
+    os.environ.setdefault('GDK_BACKEND', 'x11')
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
@@ -18,7 +26,7 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 W, H = 220, 90       # mahallenin mantıksal piksel boyutu
 PANEL = 22           # soldaki internet tüplerinin genişliği
-S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2)
+S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2); HiDPI'de küçülür
 ALWAYS_NIGHT = True  # mahalle hep gece
 FPS = 12
 GROUND = 66          # evlerin oturduğu çizgi (çimen satırı)
@@ -84,14 +92,39 @@ class Metrics:
         self.down = self.up = 0.0
         self._prev = self._cpu_times()
         self._net_prev = (time.monotonic(), *self._net_bytes())
-        self._nvidia = shutil.which('nvidia-smi') is not None
-        self._temp_file = None
-        for d in glob.glob('/sys/class/hwmon/hwmon*'):
+        self._temp_file = self._find_temp_file()
+        if shutil.which('nvidia-smi'):
+            # nvidia-smi yavaş olabilir; GTK döngüsünü bloklamasın diye ayrı iş parçacığı
+            threading.Thread(target=self._poll_gpu, daemon=True).start()
+
+    @staticmethod
+    def _find_temp_file():
+        for d in sorted(glob.glob('/sys/class/hwmon/hwmon*')):
             try:
                 if read(d + '/name').strip() in ('coretemp', 'k10temp', 'zenpower'):
-                    self._temp_file = d + '/temp1_input'
+                    return d + '/temp1_input'
             except OSError:
                 pass
+        # yedek: ısıl bölgeler (dizüstü, ARM vb.); CPU'ya benzeyen ilk bölge, yoksa ilki
+        zones = sorted(glob.glob('/sys/class/thermal/thermal_zone*'))
+        for z in zones:
+            try:
+                if any(k in read(z + '/type') for k in ('x86_pkg_temp', 'cpu', 'soc')):
+                    return z + '/temp'
+            except OSError:
+                pass
+        return zones[0] + '/temp' if zones else None
+
+    def _poll_gpu(self):
+        while True:
+            try:
+                out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu',
+                                      '--format=csv,noheader,nounits'],
+                                     capture_output=True, text=True, timeout=5).stdout
+                self.gpu = float(out.split()[0])
+            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                self.gpu = 0.0
+            time.sleep(2)
 
     @staticmethod
     def _cpu_times():
@@ -132,14 +165,6 @@ class Metrics:
             self.down = max(0, rx - rx0) / (now - t0)
             self.up = max(0, tx - tx0) / (now - t0)
 
-        if self._nvidia:
-            try:
-                out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu',
-                                      '--format=csv,noheader,nounits'],
-                                     capture_output=True, text=True, timeout=1).stdout
-                self.gpu = float(out.split()[0])
-            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-                self.gpu = 0.0
         if self._temp_file:
             try:
                 self.temp = int(read(self._temp_file)) / 1000
@@ -195,6 +220,7 @@ class Person:
         self.done = False
         self.dog = None
         self.script = None
+        self.kind = 'pedestrian'   # 'pedestrian' | 'mover' | 'gardener'
 
 
 class Dog:
@@ -242,6 +268,7 @@ class World:
     def __init__(self):
         self.t = 0
         self.light = 1.0
+        self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
         self.houses = [House(d) for d in HOUSES]
         self.shop = self.houses[2]
         self.people = []
@@ -264,10 +291,12 @@ class World:
         self.truck_script = self.run_truck()
         for i in range(2):
             m = Person(self.houses[3].door_x + i * 8)
+            m.kind = 'mover'
             m.shirt = hx('#2f6db5')
             m.script = self.run_mover(m, self.houses[3])
             self.people.append(m)
         g = Person()
+        g.kind = 'gardener'
         g.visible = False
         g.script = self.run_gardener(g, self.houses[0])
         self.people.append(g)
@@ -427,7 +456,7 @@ class World:
                 p.dog.x += max(-0.9, min(0.9, target - p.dog.x))
         self.people = [p for p in self.people if not p.done]
 
-        walkers = sum(1 for p in self.people if p.script.__name__ == 'run_pedestrian')
+        walkers = sum(1 for p in self.people if p.kind == 'pedestrian')
         target = round(self.metrics.cpu / 100 * MAX_WALKERS)
         if walkers < target and random.random() < 0.05:
             p = Person()
@@ -518,14 +547,55 @@ class World:
             self.px(bx - 1, by - up, 1, 1, '#333333')
             self.px(bx + 1, by - up, 1, 1, '#333333')
 
-        for h in self.houses:
-            self.draw_house(h, night)
+        lit = tuple(w[2] for h in self.houses for w in h.windows)
+        self.layer('houses', (self.light, lit, self.shop_lit[0], tuple(bool(h.open) for h in self.houses)),
+                   lambda: [self.draw_house(h, night) for h in self.houses])
         for sx, sy, age in self.smoke:
             size = 1 + age // 25
             self.px(sx, sy, size, size, '#d0d0d0', alpha=max(0.0, 0.8 - age / 90))
         for i, tx in enumerate(TREES):
             self.draw_tree(tx, i)
 
+        self.layer('ground', self.light, lambda: self.draw_ground(night))
+
+        for p in self.people:
+            if p.visible:
+                self.px(p.x, FEET, 4, 1, '#000000', alpha=0.18)
+                self.draw_person(p)
+            if p.dog and p.visible:
+                self.draw_dog(p.dog, p)
+
+        self.layer('road', self.light, self.draw_road)
+        self.draw_truck(night)
+        for cx, _, c in self.cars:
+            self.draw_car(cx, c, night)
+        self.layer('lamps', self.light, lambda: [self.draw_lamp(lx, night) for lx in LAMPS])
+
+    def layer(self, name, key, draw, shift=True):
+        """Değişmeyen katmanı bir kez yüzeye çizer, anahtar değişene kadar yüzeyi basar."""
+        ent = self.layers.get(name)
+        if ent is None or ent[0] != key:
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, (PANEL + W) * S, H * S)
+            c = cairo.Context(surf)
+            c.set_antialias(cairo.ANTIALIAS_NONE)
+            c.scale(S, S)
+            if shift:
+                c.translate(PANEL, 0)
+            outer, self.ctx = self.ctx, c
+            try:
+                draw()
+            finally:
+                self.ctx = outer
+            ent = self.layers[name] = (key, surf)
+        ctx = self.ctx
+        ctx.save()
+        ctx.identity_matrix()
+        ctx.set_source_surface(ent[1], 0, 0)
+        ctx.get_source().set_filter(cairo.FILTER_NEAREST)
+        ctx.paint()
+        ctx.restore()
+
+    def draw_ground(self, night):
         # çimen, çiçekler, kaldırım
         self.px(0, GROUND, W, 1, '#7fb069')
         for x in self.tufts:
@@ -546,36 +616,17 @@ class World:
                             alpha=0.11 - i * 0.002)
                 self.px(lx - 7, FEET, 15, 1.5, '#ffe08a', glow=True, alpha=0.12)
 
-        for p in self.people:
-            if p.visible:
-                self.px(p.x, FEET, 4, 1, '#000000', alpha=0.18)
-                self.draw_person(p)
-            if p.dog and p.visible:
-                self.draw_dog(p.dog, p)
-
+    def draw_road(self):
         # bordür ve yol
         self.px(0, FEET + 2, W, 1, '#e2ded6')
         self.px(0, FEET + 3, W, 1, '#8c8679')
         self.px(0, FEET + 4, W, H - FEET - 4, '#4a4a52')
         for dx in range(0, W, 10):
             self.px(dx, 82, 6, 1, '#e8e1a0')
-        self.draw_truck(night)
-        for cx, _, c in self.cars:
-            self.draw_car(cx, c, night)
-        for lx in LAMPS:
-            self.draw_lamp(lx, night)
 
     def draw_tubes(self):
         night = self.light < 0.5
-        wood, wood_dark = '#8a6440', '#5e4329'
-        # raf: arkadaki tahta, ayaklar ve taban
-        self.px(1, 56, PANEL - 2, 3, wood)
-        self.px(1, 58, PANEL - 2, 1, wood_dark)
-        self.px(1, 59, 1, TUBE_BOT - 58, wood_dark)
-        self.px(PANEL - 2, 59, 1, TUBE_BOT - 58, wood_dark)
-        self.px(0, TUBE_BOT + 1, PANEL, 3, wood)
-        self.px(0, TUBE_BOT + 1, PANEL, 1, '#b08a5f')
-        self.px(0, TUBE_BOT + 3, PANEL, 1, wood_dark)
+        self.layer('shelf', self.light, self.draw_shelf, shift=False)
 
         edge, glass = '#c9dce8', '#e6f6ff'
         for tube in self.tubes:
@@ -617,6 +668,17 @@ class World:
             self.px(x + 5, TUBE_BOT - 1, 1, 1, edge)
             self.px(x + 2, TUBE_BOT, 3, 1, edge)
             self.px(x + 2, TUBE_TOP + 3, 1, body - 8, '#ffffff', alpha=0.4)
+
+    def draw_shelf(self):
+        wood, wood_dark = '#8a6440', '#5e4329'
+        # raf: arkadaki tahta, ayaklar ve taban
+        self.px(1, 56, PANEL - 2, 3, wood)
+        self.px(1, 58, PANEL - 2, 1, wood_dark)
+        self.px(1, 59, 1, TUBE_BOT - 58, wood_dark)
+        self.px(PANEL - 2, 59, 1, TUBE_BOT - 58, wood_dark)
+        self.px(0, TUBE_BOT + 1, PANEL, 3, wood)
+        self.px(0, TUBE_BOT + 1, PANEL, 1, '#b08a5f')
+        self.px(0, TUBE_BOT + 3, PANEL, 1, wood_dark)
 
     def draw_house(self, h, night):
         wall, roof = hx(h.wall), hx(h.roof)
@@ -809,7 +871,11 @@ class World:
 
 class Window(Gtk.Window):
     def __init__(self):
+        global S
         super().__init__(title='Piksel Mahalle')
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        S = max(1, round(S / monitor.get_scale_factor()))   # HiDPI'de pencere şişmesin
         self.world = World()
         self.world.update_light()
         self.set_decorated(False)
@@ -826,8 +892,6 @@ class Window(Gtk.Window):
         width = (PANEL + W) * S
         self.set_default_size(width, H * S)
 
-        display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
         area = monitor.get_workarea()
         self.move(area.x + area.width - width - 20, area.y + area.height - H * S)
 
@@ -836,7 +900,10 @@ class Window(Gtk.Window):
         GLib.timeout_add(1000 // FPS, self.tick)
 
     def tick(self):
-        self.world.step()
+        try:
+            self.world.step()
+        except Exception:   # tek hata animasyonu sessizce durdurmasın
+            traceback.print_exc()
         self.queue_draw()
         return True
 
@@ -851,6 +918,14 @@ class Window(Gtk.Window):
 
 
 def main():
+    global S, ALWAYS_NIGHT
+    ap = argparse.ArgumentParser(description='Masaüstünde duran küçük bir piksel mahalle.')
+    ap.add_argument('--scale', type=int, default=S, help='her mantıksal pikselin ekran boyutu (varsayılan %(default)s)')
+    ap.add_argument('--day', action='store_true', help='mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
+    args = ap.parse_args()
+    S = max(1, args.scale)
+    if args.day:
+        ALWAYS_NIGHT = False
     win = Window()
     win.show_all()
     win.input_shape_combine_region(cairo.Region())  # tıklamalar içinden geçsin

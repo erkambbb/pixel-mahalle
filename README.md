@@ -34,3 +34,13 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
 ```bash
 ./mahalle.py
 ```
+
+Seçenekler: `--scale N` (piksel boyutu, HiDPI'de otomatik küçülür), `--day` (saate göre gündüz/gece). Wayland'de XWayland varsa otomatik olarak X11 kullanılır, böylece pencere sağ alta yerleşir.
+
+Sıcaklık sensörü bulunamazsa `/sys/class/thermal` yedek olarak denenir.
+
+## Test
+
+```bash
+python3 -m unittest -v
+```
