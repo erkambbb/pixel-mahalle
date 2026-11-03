@@ -13,7 +13,7 @@ Mahalle, bilgisayarın o anki durumunu canlı olarak yansıtır. Değerler 2 san
 | 💡 Sarı yanan pencereler | **İşlemci sıcaklığı** | 40 °C'de hepsi sönük, 110 °C'de hepsi yanık |
 | 🧪 Soldaki yeşil tüp (↓) | **İndirme hızı** | Logaritmik: boş = 1 KB/s, dolu = 100 MB/s |
 | 🧪 Soldaki turuncu tüp (↑) | **Yükleme hızı** | Tüp üzerindeki her çizgi 10 kat artış demek |
-| 🌙 Gündüz / gece ışığı | **Saat** | 07:00–18:00 gündüz, 20:30–05:30 gece |
+| 🌙 Gece ışığı | Sabit | Mahalle hep gece; `ALWAYS_NIGHT = False` yapılırsa saate göre değişir |
 
 Tüplerdeki çizgiler sırasıyla 10 KB/s, 100 KB/s, 1 MB/s ve 10 MB/s'yi gösterir. Trafik arttıkça kabarcıklar da hızlanır.
 

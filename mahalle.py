@@ -18,7 +18,8 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 W, H = 220, 90       # mahallenin mantıksal piksel boyutu
 PANEL = 22           # soldaki internet tüplerinin genişliği
-S = 3                # her mantıksal piksel ekranda S x S
+S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2)
+ALWAYS_NIGHT = True  # mahalle hep gece
 FPS = 12
 GROUND = 66          # evlerin oturduğu çizgi (çimen satırı)
 FEET = 72            # kaldırımda yürüyenlerin ayak hizası
@@ -382,6 +383,9 @@ class World:
     # ---- güncelleme ----
 
     def update_light(self):
+        if ALWAYS_NIGHT:
+            self.light = 0.0
+            return
         now = datetime.datetime.now()
         h = now.hour + now.minute / 60
         if 7 <= h < 18:
@@ -476,8 +480,20 @@ class World:
         c = color(c)
         c = c if glow else self.tint(c)
         self.ctx.set_source_rgba(c[0], c[1], c[2], alpha)
-        self.ctx.rectangle(int(round(x)), int(round(y)), w, h)
+        # yarım piksel ızgarası: çözünürlük 2 kat
+        self.ctx.rectangle(round(x * 2) / 2, round(y * 2) / 2, round(w * 2) / 2, round(h * 2) / 2)
         self.ctx.fill()
+
+    def glow(self, cx, cy, r, c, alpha):
+        """Yarım piksel adımlı, kenara doğru sönen yuvarlak ışık."""
+        for k in (1.0, 0.7, 0.45):
+            rr = r * k
+            y = -rr
+            while y <= rr:
+                half = round(math.sqrt(max(0.0, rr * rr - y * y)) * 2) / 2
+                if half:
+                    self.px(cx - half, cy + y, half * 2, 0.5, c, glow=True, alpha=alpha)
+                y += 0.5
 
     def draw(self, ctx):
         self.ctx = ctx
@@ -524,9 +540,11 @@ class World:
 
         for lx in LAMPS:
             if night:
-                for i in range(FEET + 2 - 56):
-                    half = 1 + i // 3
-                    self.px(lx - half, 56 + i, 2 * half + 1, 1, '#ffe08a', glow=True, alpha=0.1)
+                for i in range(2 * (FEET + 2 - 56)):
+                    half = 1 + i / 6
+                    self.px(lx + 0.5 - half, 56 + i / 2, 2 * half, 0.5, '#ffe08a', glow=True,
+                            alpha=0.11 - i * 0.002)
+                self.px(lx - 7, FEET, 15, 1.5, '#ffe08a', glow=True, alpha=0.12)
 
         for p in self.people:
             if p.visible:
@@ -628,15 +646,19 @@ class World:
 
         for wx, wy, lit in h.windows:
             if lit:
-                self.px(wx - 1, wy - 1, 7, 7, '#ffb52e', glow=True, alpha=0.35 if night else 0.25)
+                self.glow(wx + 2.5, wy + 2.5, 5, '#ffb52e', 0.07)
+                self.px(wx - 0.5, wy - 0.5, 6, 6, '#ffb52e', glow=True, alpha=0.3)
                 self.px(wx, wy, 5, 5, '#ffcf3f', glow=True)
                 self.px(wx, wy + 3, 5, 2, '#ff9f1a', glow=True)
             else:
                 self.px(wx, wy, 5, 5, '#1f2a40' if night else '#5f7f99')
                 if not night:
                     self.px(wx, wy, 2, 2, '#9dbbd0')
-            self.px(wx + 2, wy, 1, 5, '#f5f5f5')
-            self.px(wx, wy + 2, 5, 1, '#f5f5f5')
+            if lit:
+                self.px(wx, wy, 1, 4.5, '#c0392b', glow=True, alpha=0.8)
+                self.px(wx + 4, wy, 1, 4.5, '#c0392b', glow=True, alpha=0.8)
+            self.px(wx + 2.25, wy, 0.5, 5, '#f5f5f5')
+            self.px(wx, wy + 2.25, 5, 0.5, '#f5f5f5')
             self.px(wx - 1, wy + 5, 7, 1, '#f5f5f5')
             self.px(wx - 1, wy + 6, 7, 1, shade(wall, 0.8))
 
@@ -686,7 +708,8 @@ class World:
         self.px(lx - 1, 52, 3, 1, '#2a2a2a')
         if night:
             self.px(lx - 1, 54, 3, 1, '#fff6c8', glow=True)
-            self.px(lx - 3, 52, 7, 5, '#ffe08a', glow=True, alpha=0.15)
+            self.glow(lx + 0.5, 54.5, 6, '#ffe08a', 0.07)
+            self.px(lx - 0.5, 54, 2, 0.5, '#ffffff', glow=True)
         else:
             self.px(lx - 1, 54, 3, 1, '#d8d2b0')
 
@@ -776,7 +799,10 @@ class World:
             self.px(wx + 2 * ((self.t // 2) % 2), 88, 1, 1, '#9e9e9e')
         if night:
             self.px(x, 84, 1, 1, '#fff3b0', glow=True)
-            self.px(x - 6, 83, 6, 3, '#fff3b0', glow=True, alpha=0.15)
+            for i in range(24):
+                self.px(x - 0.5 - i / 2, 84 - i / 12, 0.5, 1 + i / 6, '#fff3b0', glow=True,
+                        alpha=0.22 - i * 0.008)
+            self.px(x + 15, 83.5, 2, 2, '#ff3b30', glow=True, alpha=0.25)
         else:
             self.px(x, 84, 1, 1, '#f5e6a0')
 
