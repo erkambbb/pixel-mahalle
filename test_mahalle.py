@@ -110,12 +110,14 @@ class LifeTest(unittest.TestCase):
             p.kind, p.script = kind, run(p)
             w.people.append(p)
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, (m.PANEL + m.W) * m.S, m.H * m.S)
+        fired = False
         for _ in range(900):
             w.step()
             w.draw(cairo.Context(surf))
+            fired = fired or bool(w.sparks)
         self.assertGreater(w.sleep, 0.9)
         self.assertTrue(w.event.fireworks)
-        self.assertTrue(w.sparks or w.rockets)
+        self.assertTrue(fired)
 
 
 if __name__ == '__main__':

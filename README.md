@@ -8,14 +8,17 @@ Mahalle, bilgisayarın o anki durumunu canlı olarak yansıtır. Değerler 2 san
 
 | Mahallede gördüğün | Temsil ettiği | Nasıl okunur |
 |---|---|---|
-| 🚶 Kaldırımda yürüyen insanlar | **İşlemci (CPU) kullanımı** | %0'da sokak boş, %100'de 14 yaya |
-| 🚗 Yoldaki arabalar | **Ekran kartı (GPU) kullanımı** | %0'da yol boş, %100'de 8 araba (`nvidia-smi` gerekir) |
+| 🚶 Kaldırımda yürüyen insanlar | **İşlemci (CPU) kullanımı** | %0'da sokak boş, %100'de her 220 px'lik sokak parçasında 14 yaya |
+| 🚗 Yoldaki arabalar | **Ekran kartı (GPU) kullanımı** | %0'da yol boş, %100'de her 220 px'te 8 araba (`nvidia-smi` gerekir) |
+| 🔥 Bacalardan çıkan duman | **Ekran kartı (GPU) sıcaklığı** | 45 °C altında arada bir ince duman çıkar. 85 °C'ye doğru yoğunlaşır ve kızarır, en sıcakta baca ağızları kor gibi parlar ve kıvılcım atar |
 | 💡 Sarı yanan pencereler | **İşlemci sıcaklığı** | 40 °C'de hepsi sönük, 110 °C'de hepsi yanık |
-| 🧪 Soldaki yeşil tüp (↓) | **İndirme hızı** | Logaritmik: boş = 1 KB/s, dolu = 100 MB/s |
-| 🧪 Soldaki turuncu tüp (↑) | **Yükleme hızı** | Tüp üzerindeki her çizgi 10 kat artış demek |
+| 🧪 Sağdaki yeşil tüp (↓) | **İndirme hızı** | Logaritmik: boş = 1 KB/s, dolu = 100 MB/s |
+| 🧪 Sağdaki turuncu tüp (↑) | **Yükleme hızı** | Tüp üzerindeki her çizgi 10 kat artış demek |
 | 🌙 Gece ışığı | Sabit | Mahalle hep gece; `ALWAYS_NIGHT = False` yapılırsa saate göre değişir |
 
 Tüplerdeki çizgiler sırasıyla 10 KB/s, 100 KB/s, 1 MB/s ve 10 MB/s'yi gösterir. Trafik arttıkça kabarcıklar da hızlanır.
+
+Mahalle ekranın alt kenarı boyunca tüm genişliği kaplar. İlk beş evden sonrası ekran genişliğine göre otomatik dizilir.
 
 Taşınma kamyonu, bahçıvan ve kuşlar yalnızca süs; bir ölçümü temsil etmez.
 
@@ -44,7 +47,7 @@ Mahallenin havası da Yalova'yı izler:
 
 ## Mahalle hayatı
 
-- **Pil tabelası:** Dükkân tabelası pil göstergesine dönüşür.
+- **Pil tabelası:** Dükkân tabelası pil göstergesine dönüşür ve yüzdeyi gösterir. Fişe takılıyken yanında kablo ve fiş, içinde şimşek çıkar.
 - **Uyku:** 5 dakika klavye ve fareye dokunulmazsa (`--uyku DK`) ışıklar tek tek söner, millet evine girer, evlerden Zzz yükselir. Ağaçta baykuş belirir, çatıdaki kedi kıvrılıp uyur, saat kısılır. Dokununca hepsi uyanır.
 - **Özel günler:**
   - 23 Nisan, 19 Mayıs, 15 Temmuz, 30 Ağustos ve 29 Ekim'de çatılarda Türk bayrağı dalgalanır. 29 Ekim akşamı havai fişek atılır.

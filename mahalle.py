@@ -31,8 +31,8 @@ import saat  # noqa: E402
 import sistem  # noqa: E402
 import takvim  # noqa: E402
 
-W, H = 220, 90       # mahallenin mantıksal piksel boyutu
-PANEL = 22           # soldaki internet tüplerinin genişliği
+W, H = 220, 90       # mahallenin mantıksal piksel boyutu (W açılışta ekran genişliğine uzatılır)
+PANEL = 28           # sağdaki internet tüplerinin genişliği
 S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2); HiDPI'de küçülür
 ALWAYS_NIGHT = True  # mahalle hep gece
 FPS = 12
@@ -67,18 +67,54 @@ SHIRT = [hx(c) for c in ('#d9534f', '#3e7cb1', '#5cb85c', '#f0ad4e', '#8e44ad', 
 PANTS = [hx(c) for c in ('#2c3e50', '#34495e', '#5d4037', '#3b3b98', '#555555')]
 CARS = [hx(c) for c in ('#e74c3c', '#3498db', '#f1c40f', '#ecf0f1', '#2ecc71', '#9b59b6')]
 
+# chimney: bacanın evin solundan uzaklığı (None = bacasız)
 HOUSES = [
-    dict(x=6, w=34, h=24, wall='#e8c39e', roof='#b5523b', kind='gable', door=14),
-    dict(x=48, w=30, h=34, wall='#9fb8c9', roof='#5a6a78', kind='flat', door=12),
-    dict(x=88, w=38, h=22, wall='#f2e6c9', roof='#3f7f5f', kind='shop', door=24),
-    dict(x=136, w=32, h=26, wall='#c9a0b8', roof='#6b3f5a', kind='gable', door=6),
-    dict(x=178, w=36, h=20, wall='#d7d98f', roof='#8a5a2b', kind='gable', door=22),
+    dict(x=6, w=34, h=24, wall='#e8c39e', roof='#b5523b', kind='gable', door=14, chimney=25),
+    dict(x=48, w=30, h=34, wall='#9fb8c9', roof='#5a6a78', kind='flat', door=12, chimney=5),
+    dict(x=88, w=38, h=26, wall='#f2e6c9', roof='#3f7f5f', kind='shop', door=24, chimney=None),
+    dict(x=136, w=32, h=26, wall='#c9a0b8', roof='#6b3f5a', kind='gable', door=6, chimney=6),
+    dict(x=178, w=36, h=20, wall='#d7d98f', roof='#8a5a2b', kind='gable', door=22, chimney=27),
 ]
 TREES = [43, 83, 131, 172]
 LAMPS = [30, 108, 200]
+PUDDLES = (20, 60, 116, 158, 194)             # kaldırımdaki su birikintilerinin x'i
+# ilk beş evden sonra mahalle ekran genişliğince bu kalıplarla uzar
+EXTRA = [dict(w=32, h=24, kind='gable'), dict(w=28, h=32, kind='flat'), dict(w=36, h=22, kind='gable'),
+         dict(w=30, h=28, kind='gable'), dict(w=34, h=30, kind='flat'), dict(w=30, h=20, kind='gable')]
+WALLS = ['#e8c39e', '#9fb8c9', '#c9a0b8', '#d7d98f', '#b8d4c0', '#e3b5a4', '#c4b7e0', '#f0d9a8']
+ROOFS = ['#b5523b', '#5a6a78', '#6b3f5a', '#8a5a2b', '#3f6b7f', '#7a3b3b', '#4a5a3a']
 TEMP_MIN, TEMP_MAX = 40, 110   # bu aralıkta pencereler 0'dan hepsine kadar yanar
-MAX_WALKERS = 14               # %100 CPU'da yoldaki yaya sayısı
-MAX_CARS = 8                   # %100 GPU'da yoldaki araba sayısı
+GPU_COOL, GPU_HOT = 45, 85     # GPU bu sıcaklıklar arasında bacalar sakinden kıpkırmızıya
+MAX_WALKERS = 14               # %100 CPU'da 220 px'lik sokaktaki yaya sayısı (genişlikle ölçeklenir)
+MAX_CARS = 8                   # %100 GPU'da 220 px'lik yoldaki araba sayısı
+
+
+def layout(width):
+    """Evler, ağaçlar, lambalar ve su birikintileri: ilk beşi sabit, gerisi genişliği doldurur."""
+    rng = random.Random(21)
+    houses, trees = [dict(d) for d in HOUSES], list(TREES)
+    x, i = 224, 0
+    while True:
+        t = EXTRA[i % len(EXTRA)]
+        i += 1
+        w = t['w'] + rng.choice((-2, 0, 2))
+        if x + w > width - 4:
+            break
+        if t['kind'] == 'gable':
+            chimney = rng.choice((6, w - 9))
+        else:
+            chimney = 5 if rng.random() < 0.8 else None
+        houses.append(dict(x=x, w=w, h=t['h'] + rng.choice((-2, 0, 2)), wall=rng.choice(WALLS),
+                           roof=rng.choice(ROOFS), kind=t['kind'], door=rng.choice((5, w // 2 - 2, w - 11)),
+                           chimney=chimney))
+        x += w
+        gap = rng.choice((8, 10, 12))
+        if rng.random() < 0.8:
+            trees.append(x + 3)
+        x += gap
+    lamps = LAMPS + list(range(285, width - 10, 85))
+    puddles = PUDDLES + tuple(range(234, width - 10, 40))
+    return houses, trees, lamps, puddles
 
 # İnternet tüpleri: doluluk logaritmik, NET_MIN'de boş, NET_MAX'ta dolu (bayt/sn)
 NET_MIN, NET_MAX = 1e3, 1e8    # 1 KB/s .. 100 MB/s
@@ -88,8 +124,7 @@ TUBE_TOP, TUBE_BOT = 12, 85    # cam tüpün ağız ve dip satırı
 UMBRELLAS = [hx(c) for c in ('#e74c3c', '#2980b9', '#f1c40f', '#27ae60', '#8e44ad', '#ecf0f1', '#e67e22', '#2d3436')]
 SCARVES = [hx(c) for c in ('#c0392b', '#f39c12', '#16a085', '#ecf0f1', '#8e44ad')]
 SNOW_WHITE = '#f4f7fb'
-PUDDLES = (20, 60, 116, 158, 194)             # kaldırımdaki su birikintilerinin x'i
-MOON_X, MOON_Y, MOON_R = 116, 12, 5
+MOON_Y, MOON_R = 12, 5
 SYNODIC, NEW_MOON = 29.530588853, 947182440   # ay döngüsü (gün), 6 Oca 2000 18:14 UTC yeniay
 COLD = 8                                      # bu sıcaklığın altında atkı/bere
 SLEEP_AFTER = 5 * 60                          # bu kadar sn klavye/fare boşta kalınca mahalle uyur
@@ -137,11 +172,20 @@ class Metrics:
 
     def __init__(self):
         self.cpu = self.gpu = 0.0
+        self.gpu_temp = None   # °C; bilinmiyorsa None
         self.temp = TEMP_MIN
         self.down = self.up = 0.0
         self._prev = self._cpu_times()
         self._net_prev = (time.monotonic(), *self._net_bytes())
         self._temp_file = self._find_temp_file()
+        self._gpu_temp_file = None
+        for d in sorted(glob.glob('/sys/class/hwmon/hwmon*')):   # NVIDIA yoksa AMD/Intel/nouveau
+            try:
+                if read(d + '/name').strip() in ('amdgpu', 'radeon', 'nouveau', 'i915', 'xe'):
+                    self._gpu_temp_file = d + '/temp1_input'
+                    break
+            except OSError:
+                pass
         if shutil.which('nvidia-smi'):
             # nvidia-smi yavaş olabilir; GTK döngüsünü bloklamasın diye ayrı iş parçacığı
             threading.Thread(target=self._poll_gpu, daemon=True).start()
@@ -167,10 +211,11 @@ class Metrics:
     def _poll_gpu(self):
         while True:
             try:
-                out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu',
+                out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu',
                                       '--format=csv,noheader,nounits'],
                                      capture_output=True, text=True, timeout=5).stdout
-                self.gpu = float(out.split()[0])
+                util, temp = out.splitlines()[0].split(',')[:2]
+                self.gpu, self.gpu_temp = float(util), float(temp)
             except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
                 self.gpu = 0.0
             time.sleep(2)
@@ -219,6 +264,11 @@ class Metrics:
                 self.temp = int(read(self._temp_file)) / 1000
             except (OSError, ValueError):
                 pass
+        if self._gpu_temp_file:
+            try:
+                self.gpu_temp = int(read(self._gpu_temp_file)) / 1000
+            except (OSError, ValueError):
+                pass
 
 
 def moon_phase(t=None):
@@ -252,6 +302,9 @@ class House:
         self.__dict__.update(d)
         self.top = GROUND - self.h
         self.door_x = self.x + self.door
+        c = d.get('chimney')
+        # baca: (sol x, şapka y); dumanı şapkanın üstünden çıkar
+        self.chimney = None if c is None else (self.x + c, self.top - (13 if self.kind == 'gable' else 8))
         self.open = 0
         self.windows = []
         if self.kind != 'shop':
@@ -315,6 +368,7 @@ class Truck:
 class Tube:
     """Ağ trafiğini gösteren, kabarcıklı sıvı dolu cam tüp."""
     INNER = TUBE_BOT - TUBE_TOP - 1    # sıvının dolabileceği satır sayısı
+    IW = 7                             # camın iç genişliği
 
     def __init__(self, x, liquid, arrow):
         self.x = x
@@ -333,7 +387,7 @@ class Tube:
         self.level += (self.target - self.level) * 0.12
         height = self.level * self.INNER
         if height > 3 and random.random() < 0.08 + self.level * 0.4:
-            self.bubbles.append([random.randint(0, 3), 0.0, random.uniform(0.3, 0.6 + self.level)])
+            self.bubbles.append([random.randint(0, self.IW - 2), 0.0, random.uniform(0.3, 0.6 + self.level)])
         for b in self.bubbles:
             b[1] += b[2]
         self.bubbles = [b for b in self.bubbles if b[1] < height - 2]
@@ -354,14 +408,18 @@ class World:
         self.cats = []
         self.light = 1.0
         self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
-        self.houses = [House(d) for d in HOUSES]
+        houses, self.trees, self.lamps, self.puddles = layout(W)
+        self.houses = [House(d) for d in houses]
+        self.scale = W / 220               # nüfus, bulut, yağış genişlikle ölçeklenir
+        self.moon_x = round(W * 0.53)
+        self.heat = 0.0                    # GPU sıcaklığı 0..1 (yumuşatılmış)
         self.shop = self.houses[2]
         self.people = []
         self.cars = []
         self.birds = []
         self.smoke = []
         self.clouds = [[random.uniform(0, W), random.uniform(3, 18), random.randint(12, 22),
-                        random.uniform(0.03, 0.07)] for _ in range(9)]
+                        random.uniform(0.03, 0.07)] for _ in range(round(9 * W / 220))]
         # hava: hedef değerlere yavaşça yaklaşan yumuşatılmış durum
         self.weather = weather or hava.Weather(fetch=False)
         w = self.weather
@@ -373,12 +431,12 @@ class World:
         rng = random.Random(11)
         self.stars = [(rng.uniform(0, W), rng.uniform(1, 44), rng.uniform(0, 6.3), rng.uniform(0.03, 0.12),
                        rng.random() < 0.15, rng.choice(('#ffffff', '#cfe3ff', '#fff1c9')))
-                      for _ in range(55)]
+                      for _ in range(round(55 * W / 220))]
         self.fog_blobs = [[rng.uniform(0, W + 60), rng.uniform(25, 84), rng.uniform(25, 55),
-                           rng.uniform(2, 6), rng.uniform(0.03, 0.15)] for _ in range(16)]
+                           rng.uniform(2, 6), rng.uniform(0.03, 0.15)] for _ in range(round(16 * W / 220))]
         self.truck = Truck()
         self.metrics = Metrics()
-        self.tubes = [Tube(3, '#3ddc97', 'down'), Tube(12, '#ff9f43', 'up')]
+        self.tubes = [Tube(3, '#3ddc97', 'down'), Tube(3 + Tube.IW + 5, '#ff9f43', 'up')]
         self.shop_lit = [False]
         # Sıcaklık arttıkça bu sırayla yanarlar (dükkan vitrini dahil 22 pencere)
         self.light_order = [w for h in self.houses for w in h.windows] + [self.shop_lit]
@@ -702,8 +760,8 @@ class World:
         self.people = [p for p in self.people if not p.done]
 
         walkers = sum(1 for p in self.people if p.kind == 'pedestrian')
-        target = round(self.metrics.cpu / 100 * MAX_WALKERS * (1 - self.sleep))
-        if walkers < target and random.random() < 0.05:
+        target = round(self.metrics.cpu / 100 * MAX_WALKERS * self.scale * (1 - self.sleep))
+        if walkers < target and random.random() < 0.05 * self.scale:
             p = Person()
             if self.rain > 0.3 and not p.umbrella:
                 p.speed *= 1.8   # şemsiyesi olmayan koşar
@@ -718,7 +776,7 @@ class World:
         for h in self.houses:
             h.open = max(0, h.open - 1)
 
-        car_target = round(self.metrics.gpu / 100 * MAX_CARS * (1 - self.sleep))
+        car_target = round(self.metrics.gpu / 100 * MAX_CARS * self.scale * (1 - self.sleep))
         if len(self.cars) < car_target and random.random() < 0.08 and all(c[0] < W - 22 for c in self.cars):
             self.cars.append([W + 2.0, random.uniform(1.0, 1.6), random.choice(CARS)])
         for c in self.cars:
@@ -737,14 +795,22 @@ class World:
             b[0] += 0.9
         self.birds = [b for b in self.birds if b[0] < W + 5]
 
-        chimney = self.houses[0]
-        if self.t % 9 == 0:
-            self.smoke.append([chimney.x + chimney.w - 8.0, chimney.top - 9.0, 0])
+        # bacalar GPU sıcaklığıyla tüter: serinken arada bir, ısındıkça yoğun ve kızıl, çok sıcakta kıvılcım
+        gt = self.metrics.gpu_temp
+        target = 0.0 if gt is None else max(0.0, min(1.0, (gt - GPU_COOL) / (GPU_HOT - GPU_COOL)))
+        self.heat += (target - self.heat) * 0.02
+        for h in self.houses:
+            if h.chimney:
+                cx, ct = h.chimney
+                if random.random() < 0.012 + self.heat * 0.2:
+                    self.smoke.append([cx + 1 + random.uniform(-0.5, 0.5), ct - 1.0, 0, self.heat, False])
+                if self.heat > 0.8 and random.random() < (self.heat - 0.8) * 0.5:
+                    self.smoke.append([cx + 1 + random.uniform(-1, 1), ct - 0.5, 0, self.heat, True])
         for s in self.smoke:
-            s[0] += 0.06 + self.wind * 0.35
-            s[1] -= 0.18 - self.wind * 0.08
+            s[0] += 0.06 + self.wind * 0.35 + (random.uniform(-0.15, 0.15) if s[4] else 0)
+            s[1] -= (0.35 if s[4] else 0.18) - self.wind * 0.08
             s[2] += 1
-        self.smoke = [s for s in self.smoke if s[2] < 70]
+        self.smoke = [s for s in self.smoke if s[2] < (25 if s[4] else 70 + 40 * s[3])]
         self.step_weather()
         self.step_life()
 
@@ -777,7 +843,7 @@ class World:
         self.zs = [z for z in self.zs if z[2] < 100]
 
         # havai fişek
-        if self.event and self.event.fireworks and random.random() < 0.04:
+        if self.event and self.event.fireworks and random.random() < 0.04 * self.scale:
             self.rockets.append([random.uniform(20, W - 20), float(GROUND), random.uniform(-1.6, -1.2),
                                  random.choice(FW_COLORS), random.uniform(6, 26)])
         for r in self.rockets:
@@ -814,7 +880,7 @@ class World:
 
         # yağmur damlaları: yere (kaldırım ya da yol) inince sıçrar
         slant = 0.15 + self.wind * 0.6
-        n = self.rain * 6
+        n = self.rain * 6 * self.scale
         while n > 0:
             if random.random() < n:
                 self.drops.append([random.uniform(-10, W + 50), random.uniform(-8, 0),
@@ -830,13 +896,13 @@ class World:
             sp[2] += 1
         self.splashes = [sp for sp in self.splashes if sp[2] < 3]
         if self.rain > 0.1 and self.wet > 0.3 and random.random() < self.rain * 0.6:
-            self.ripples.append([random.choice(PUDDLES) + random.uniform(1, 7), 0.0])
+            self.ripples.append([random.choice(self.puddles) + random.uniform(1, 7), 0.0])
         for r in self.ripples:
             r[1] += 0.25
         self.ripples = [r for r in self.ripples if r[1] < 3]
 
         # kar taneleri: salınarak düşer
-        n = self.snow * 1.5
+        n = self.snow * 1.5 * self.scale
         while n > 0:
             if random.random() < n:
                 self.flakes.append([random.uniform(-10, W + 40), random.uniform(-4, 0), random.uniform(0.25, 0.5),
@@ -911,12 +977,14 @@ class World:
 
     def draw(self, ctx):
         self.ctx = ctx
-        self.draw_tubes()
         ctx.save()
-        ctx.translate(PANEL, 0)
         ctx.rectangle(0, 0, W, H)
         ctx.clip()
         self.draw_scene()
+        ctx.restore()
+        ctx.save()
+        ctx.translate(W, 0)   # tüpler sağda
+        self.draw_tubes()
         ctx.restore()
 
     def draw_scene(self):
@@ -946,10 +1014,17 @@ class World:
         for x, y, age in self.zs:
             self.text('Z', x, y, 0.5 if age < 40 else 0.75, '#cfd8ff',
                       alpha=(1 - age / 100) * self.sleep)
-        for sx, sy, age in self.smoke:
-            size = 1 + age // 25
-            self.px(sx, sy, size, size, '#d0d0d0', alpha=max(0.0, 0.8 - age / 90))
-        for i, tx in enumerate(TREES):
+        self.draw_chimney_heat()
+        for sx, sy, age, f, ember in self.smoke:
+            if ember:
+                self.px(sx, sy, 0.5, 0.5, '#ffb347', glow=True, alpha=1 - age / 25)
+                continue
+            life = 70 + 40 * f
+            size = min(4, 1 + age // 25)
+            c = mix('#c9b3b0', '#ff4a3d', f * 0.75)   # hep hafif kızıl; GPU ısındıkça kıpkırmızı
+            self.px(sx - size / 2 + 0.5, sy, size, size, c, glow=f > 0.5,
+                    alpha=max(0.0, 0.8 - age / life) * (0.75 if f > 0.5 else 1))
+        for i, tx in enumerate(self.trees):
             self.draw_tree(tx, i)
         if self.sleep > 0.5:
             self.draw_owl((self.sleep - 0.5) * 2)
@@ -977,7 +1052,7 @@ class World:
         for cx, _, c in self.cars:
             self.draw_car(cx, c, night)
         self.layer('lamps', (self.light, cover, round(self.fog, 1)),
-                   lambda: [self.draw_lamp(lx, night) for lx in LAMPS])
+                   lambda: [self.draw_lamp(lx, night) for lx in self.lamps])
         self.draw_weather()
 
     def draw_sky(self):
@@ -1011,7 +1086,7 @@ class World:
         base = mix('#ffffff', '#4a5160', dark_k)
         lit = self.flash in (5, 3)
         for i, (cx, cy, cw, _) in enumerate(self.clouds):
-            a = max(0.0, min(1.0, self.cloud * 9 - i)) * 0.85
+            a = max(0.0, min(1.0, self.cloud * len(self.clouds) - i)) * 0.85
             if a <= 0:
                 continue
             top, bottom = (mix(base, '#dfe8ff', 0.6), base) if lit else (base, shade(base, 0.82))
@@ -1022,7 +1097,7 @@ class World:
 
     def draw_moon(self, phase):
         """Gerçek ay evresi: aydınlık kısım, sönük kısım ve birkaç krater."""
-        cx, cy, r = MOON_X, MOON_Y, MOON_R
+        cx, cy, r = self.moon_x, MOON_Y, MOON_R
         self.glow(cx, cy, r + 5, '#f4f1de', 0.03)
         c = math.cos(2 * math.pi * phase)
 
@@ -1049,10 +1124,10 @@ class World:
         if self.wet < 0.05:
             return
         a = self.wet
-        for x in PUDDLES:
+        for x in self.puddles:
             self.px(x + 1, FEET + 0.5, 6, 0.5, '#1d2738', glow=True, alpha=0.8 * a)
             self.px(x, FEET + 1, 8, 0.5, '#1d2738', glow=True, alpha=0.8 * a)
-            if self.light < 0.5 and any(abs(x + 4 - lx) < 12 for lx in LAMPS):
+            if self.light < 0.5 and any(abs(x + 4 - lx) < 12 for lx in self.lamps):
                 self.px(x + 3, FEET + 0.5, 2, 1, '#ffe08a', glow=True, alpha=0.45 * a)
         for rx, age in self.ripples:
             ra = 0.6 * (1 - age / 3) * a
@@ -1062,7 +1137,7 @@ class World:
     def draw_weather(self):
         for x, y, _, _ in self.drops:
             a, c = 0.32, '#9cc3e6'
-            for lx in LAMPS:   # lamba ışığına giren damla parlar
+            for lx in self.lamps:   # lamba ışığına giren damla parlar
                 if 52 < y < FEET and abs(x - lx) < 2 + (y - 52) * 0.45:
                     a, c = 0.75, '#ffe9a8'
                     break
@@ -1097,10 +1172,10 @@ class World:
                 self.px(h.x - 2 + i, h.top - 1.5 - i, 1, 0.5, SNOW_WHITE, alpha=cover)
                 self.px(h.x + h.w + 1 - i, h.top - 1.5 - i, 1, 0.5, SNOW_WHITE, alpha=cover)
             self.px(h.x - 3 + rows, h.top - rows - 0.5, h.w + 6 - 2 * rows, 1, SNOW_WHITE, alpha=cover)
-            if h is self.houses[0]:
-                self.px(h.x + h.w - 10, h.top - 10.5, 5, 0.5, SNOW_WHITE, alpha=cover)
         else:
             self.px(h.x - 1, h.top - 3, h.w + 2, 1, SNOW_WHITE, alpha=cover)
+        if h.chimney:
+            self.px(h.chimney[0] - 1, h.chimney[1] - 0.5, 5, 0.5, SNOW_WHITE, alpha=cover)
         if h.kind == 'shop':
             self.px(h.x, GROUND - 16.5, h.w, 0.5, SNOW_WHITE, alpha=cover)
 
@@ -1162,7 +1237,7 @@ class World:
             self.text('Z', c.x + 3, c.y - 4 - (self.t % 60) * 0.03, 0.5, '#cfd8ff', alpha=0.8)
 
     def draw_owl(self, a):
-        x, y = TREES[2] + self.tree_sway(2) + 1.5, GROUND - 16
+        x, y = self.trees[2] + self.tree_sway(2) + 1.5, GROUND - 16
         self.px(x, y - 4, 3, 4, '#6d4c33', alpha=a)
         self.px(x + 0.5, y - 2, 2, 1.5, '#a1887f', alpha=a)
         self.px(x, y - 4.5, 0.5, 0.5, '#6d4c33', alpha=a)
@@ -1182,30 +1257,58 @@ class World:
         self.px(wx + 2.25, wy, 0.5, 5, '#f5f5f5')
         self.px(wx, wy + 2.25, 5, 0.5, '#f5f5f5')
 
+    def draw_chimney_heat(self):
+        """GPU çok ısınınca baca ağızları kor gibi parlar."""
+        if self.heat <= 0.6:
+            return
+        a = (self.heat - 0.6) * 1.5 * (0.7 + 0.3 * math.sin(self.t * 0.5))
+        for h in self.houses:
+            if h.chimney:
+                cx, ct = h.chimney
+                self.px(cx - 0.5, ct - 0.5, 4, 1, '#ff6a3d', glow=True, alpha=a)
+
     def draw_battery_sign(self, h):
-        """Dükkân tabelası pil göstergesi: doluluk, fişe takılıysa şimşek, dolarken akan dolum."""
+        """Dükkân tabelası pil göstergesi: doluluk, yüzde, fişe takılıysa kablo ve şimşek."""
         b = self.system.battery
         if b.level is None:
             return
-        x0, y0 = h.x + 4, h.top + 3
-        self.px(x0, y0, h.w - 8, 5, '#3f7f5f')
-        self.px(x0 + 1, y0 + 0.5, h.w - 10, 4, '#14261d')
-        bx, by, edge = x0 + 3, y0 + 1, '#e9f5ee'
-        self.px(bx, by, 12, 0.5, edge, glow=True)
-        self.px(bx, by + 2.5, 12, 0.5, edge, glow=True)
-        self.px(bx, by, 0.5, 3, edge, glow=True)
-        self.px(bx + 11.5, by, 0.5, 3, edge, glow=True)
-        self.px(bx + 12, by + 0.75, 0.5, 1.5, edge, glow=True)
-        col = '#ff5a4f' if b.level < 20 else '#ffc857' if b.level < 50 else '#3ddc97'
-        fill = 11 * b.level / 100
-        self.px(bx + 0.5, by + 0.5, fill, 2, col, glow=True)
-        if b.charging and fill < 11:
-            extra = ((self.t // 3) % 8) / 7 * (11 - fill)
-            self.px(bx + 0.5 + fill, by + 0.5, extra, 2, col, glow=True, alpha=0.45)
+        x0, y0, sw = h.x + 4, h.top + 2, h.w - 8
+        self.px(x0, y0, sw, 7, '#3f7f5f')
+        self.px(x0 + 1, y0 + 0.5, sw - 2, 6, '#14261d')
+        bw, edge = 17, '#e9f5ee'
+        bx = x0 + 2 if b.plugged else x0 + (sw - bw - 1) / 2
+        by = y0 + 1
+        # gövde ve uç
+        self.px(bx, by, bw, 0.5, edge, glow=True)
+        self.px(bx, by + 4.5, bw, 0.5, edge, glow=True)
+        self.px(bx, by, 0.5, 5, edge, glow=True)
+        self.px(bx + bw - 0.5, by, 0.5, 5, edge, glow=True)
+        self.px(bx + bw, by + 1.5, 1, 2, edge, glow=True)
+        # doluluk (koyu tonlar: üstündeki yazı okunsun)
+        col = '#b83227' if b.level < 20 else '#b7791f' if b.level < 50 else '#1f8a55'
+        inner = bw - 1
+        fill = inner * b.level / 100
+        self.px(bx + 0.5, by + 0.5, fill, 4, col, glow=True)
+        if b.charging and fill < inner:
+            extra = ((self.t // 3) % 8) / 7 * (inner - fill)
+            self.px(bx + 0.5 + fill, by + 0.5, extra, 4, col, glow=True, alpha=0.45)
+        # yüzde ve şimşek ortada
+        label = str(b.level)
+        tw = text_cells(label)[1] * 0.5
+        total = tw + (2.5 if b.plugged else 0)
+        tx = math.floor((bx + (bw - total) / 2) * 2) / 2   # yarım piksel ızgarası
+        self.text(label, tx, by + 1, 0.5, '#f5fff9')
         if b.plugged and (not b.charging or (self.t // 6) % 2):
-            for cx, cy in ((2, 0), (1, 1), (0, 2), (1, 2), (2, 2), (1, 3), (0, 4)):
-                self.px(bx + 4.75 + cx * 0.5, by + 0.25 + cy * 0.5, 0.5, 0.5, '#ffe14d', glow=True)
-        self.text(str(b.level), bx + 14, by - 0.25, 0.5, edge)
+            bolt = ('..##', '.##.', '##..', '####', '..##', '.##.', '##..', '#...')
+            for cy, row in enumerate(bolt):
+                for cx, v in enumerate(row):
+                    if v == '#':
+                        self.px(tx + tw + 0.5 + cx * 0.5, by + 0.5 + cy * 0.5, 0.5, 0.5, '#ffe14d', glow=True)
+        if b.plugged:   # kablo ve fiş
+            self.px(bx + bw + 1, by + 2.25, 2.5, 0.5, '#9aa5ad', glow=True)
+            self.px(bx + bw + 3.5, by + 1, 2, 3, '#cfd6db', glow=True)
+            self.px(bx + bw + 5.5, by + 1.5, 1.5, 0.5, '#e0c068', glow=True)
+            self.px(bx + bw + 5.5, by + 3, 1.5, 0.5, '#e0c068', glow=True)
 
     def draw_decor(self, night):
         ev = self.event
@@ -1275,7 +1378,7 @@ class World:
         if night:
             self.glow(x + 6, g - 9, 5, '#ffe08a', 0.06)
 
-    def layer(self, name, key, draw, shift=True, alpha=1.0):
+    def layer(self, name, key, draw, dx=0, alpha=1.0):
         """Değişmeyen katmanı bir kez yüzeye çizer, anahtar değişene kadar yüzeyi basar."""
         ent = self.layers.get(name)
         if ent is None or ent[0] != key:
@@ -1283,8 +1386,7 @@ class World:
             c = cairo.Context(surf)
             c.set_antialias(cairo.ANTIALIAS_NONE)
             c.scale(S, S)
-            if shift:
-                c.translate(PANEL, 0)
+            c.translate(dx, 0)
             outer, self.ctx = self.ctx, c
             try:
                 draw()
@@ -1312,7 +1414,7 @@ class World:
         for sx in range(0, W, 8):
             self.px(sx, GROUND + 1, 1, FEET - GROUND + 1, '#a9a293')
 
-        for lx in LAMPS:
+        for lx in self.lamps:
             if night:
                 for i in range(2 * (FEET + 2 - 56)):
                     half = 1 + i / 6
@@ -1339,7 +1441,7 @@ class World:
         if wet:   # ıslak asfalt: koyu parlaklık ve lamba yansımaları
             self.px(0, FEET + 4, W, H - FEET - 4, '#2a3550', alpha=wet * 0.35)
             if self.light < 0.5:
-                for lx in LAMPS:
+                for lx in self.lamps:
                     for i in range(10):
                         self.px(lx - 1 + (i % 2) * 0.5, FEET + 4 + i, 2.5, 1, '#ffe08a', glow=True,
                                 alpha=wet * 0.22 * (1 - i / 10))
@@ -1351,47 +1453,48 @@ class World:
 
     def draw_tubes(self):
         night = self.light < 0.5
-        self.layer('shelf', self.light, self.draw_shelf, shift=False)
+        self.layer('shelf', self.light, self.draw_shelf, dx=W)
 
         edge, glass = '#c9dce8', '#e6f6ff'
+        iw = Tube.IW
         for tube in self.tubes:
             x, liq = tube.x, tube.liquid
             # ok simgesi
             for r, row in enumerate(tube.arrow):
                 for c, ch in enumerate(row):
                     if ch == '#':
-                        self.px(x + 1 + c, 2 + r, 1, 1, liq, glow=True)
+                        self.px(x + 1 + (iw - 5) / 2 + c, 2 + r, 1, 1, liq, glow=True)
             # mantar tıpa ve ağız
-            self.px(x + 1, TUBE_TOP - 3, 5, 3, '#a9773f')
-            self.px(x + 1, TUBE_TOP - 3, 5, 1, '#c8955a')
-            self.px(x - 1, TUBE_TOP, 9, 1, edge, alpha=0.9)
+            self.px(x + 1, TUBE_TOP - 3, iw, 3, '#a9773f')
+            self.px(x + 1, TUBE_TOP - 3, iw, 1, '#c8955a')
+            self.px(x - 1, TUBE_TOP, iw + 4, 1, edge, alpha=0.9)
             # cam gövde
             body = TUBE_BOT - TUBE_TOP - 2
-            self.px(x + 1, TUBE_TOP + 1, 5, body, glass, alpha=0.18)
-            self.px(x + 2, TUBE_BOT - 1, 3, 1, glass, alpha=0.18)
+            self.px(x + 1, TUBE_TOP + 1, iw, body, glass, alpha=0.18)
+            self.px(x + 2, TUBE_BOT - 1, iw - 2, 1, glass, alpha=0.18)
             # sıvı
             n = round(tube.level * Tube.INNER)
             if n > 0:
                 glow = night
-                self.px(x + 2, TUBE_BOT - 1, 3, 1, liq, glow=glow)
+                self.px(x + 2, TUBE_BOT - 1, iw - 2, 1, liq, glow=glow)
                 if n > 1:
-                    self.px(x + 1, TUBE_BOT - n, 5, n - 1, liq, glow=glow)
-                    self.px(x + 4, TUBE_BOT - n, 2, n - 1, shade(liq, 0.8), glow=glow)
-                    self.px(x + 1, TUBE_BOT - n, 5, 1, shade(liq, 1.3), glow=glow)
+                    self.px(x + 1, TUBE_BOT - n, iw, n - 1, liq, glow=glow)
+                    self.px(x + iw - 1, TUBE_BOT - n, 2, n - 1, shade(liq, 0.8), glow=glow)
+                    self.px(x + 1, TUBE_BOT - n, iw, 1, shade(liq, 1.3), glow=glow)
                 for bx, by, _ in tube.bubbles:
                     self.px(x + 1 + bx, TUBE_BOT - 2 - by, 1, 1, shade(liq, 1.5), glow=True, alpha=0.8)
                 if night:
-                    self.px(x - 1, TUBE_BOT - n - 1, 9, n + 2, liq, glow=True, alpha=0.08)
+                    self.px(x - 1, TUBE_BOT - n - 1, iw + 4, n + 2, liq, glow=True, alpha=0.08)
             # ölçek çizgileri (her biri 10 kat)
             for i in range(1, 5):
                 y = TUBE_BOT - 1 - round(i / 5 * Tube.INNER)
                 self.px(x + 1, y, 2, 1, edge, alpha=0.7)
             # cam kenarları ve parlama
             self.px(x, TUBE_TOP + 1, 1, body, edge)
-            self.px(x + 6, TUBE_TOP + 1, 1, body, edge)
+            self.px(x + iw + 1, TUBE_TOP + 1, 1, body, edge)
             self.px(x + 1, TUBE_BOT - 1, 1, 1, edge)
-            self.px(x + 5, TUBE_BOT - 1, 1, 1, edge)
-            self.px(x + 2, TUBE_BOT, 3, 1, edge)
+            self.px(x + iw, TUBE_BOT - 1, 1, 1, edge)
+            self.px(x + 2, TUBE_BOT, iw - 2, 1, edge)
             self.px(x + 2, TUBE_TOP + 3, 1, body - 8, '#ffffff', alpha=0.4)
 
     def draw_shelf(self):
@@ -1418,9 +1521,6 @@ class World:
                 self.px(h.x - 2 + i, h.top - 1 - i, 1, 1, shade(roof, 1.25))
             self.px(h.x - 2 + rows - 1, h.top - rows, h.w + 6 - 2 * rows, 1, shade(roof, 1.2))
             self.px(h.x - 2, h.top, h.w + 4, 1, shade(roof, 0.65))
-            if h is self.houses[0]:
-                self.px(h.x + h.w - 9, h.top - 9, 3, 6, '#8d4a3a')
-                self.px(h.x + h.w - 10, h.top - 10, 5, 1, '#6e392d')
         else:
             self.px(h.x - 1, h.top - 2, h.w + 2, 2, roof)
             self.px(h.x - 1, h.top - 2, h.w + 2, 1, shade(roof, 1.25))
@@ -1430,6 +1530,13 @@ class World:
                 self.px(ax, h.top - 9, 1, 7, '#555555')
                 self.px(ax - 2, h.top - 7, 5, 1, '#555555')
                 self.px(ax, h.top - 10, 1, 1, '#e74c3c', glow=night)
+        if h.chimney:
+            cx, ct = h.chimney
+            bottom = h.top - (4 if h.kind == 'gable' else 2)
+            self.px(cx, ct + 1, 3, bottom - ct - 1, '#8d4a3a')
+            self.px(cx + 2, ct + 1, 1, bottom - ct - 1, '#6e392d')
+            self.px(cx, ct + 2.5, 3, 0.5, '#6e392d')
+            self.px(cx - 1, ct, 5, 1, '#5a2e24')
 
         for wx, wy, lit in h.windows:
             if lit:
@@ -1646,11 +1753,9 @@ class World:
 
 class Window(Gtk.Window):
     def __init__(self, world):
-        global S
         super().__init__(title='Piksel Mahalle')
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
-        S = max(1, round(S / monitor.get_scale_factor()))   # HiDPI'de pencere şişmesin
         self.world = world
         self.world.update_light()
         self.set_decorated(False)
@@ -1668,7 +1773,7 @@ class Window(Gtk.Window):
         self.set_default_size(width, H * S)
 
         area = monitor.get_workarea()
-        self.move(area.x + area.width - width - 20, area.y + area.height - H * S)
+        self.move(area.x + (area.width - width) // 2, area.y + area.height - H * S)
 
         self.connect('draw', self.on_draw)
         self.connect('destroy', Gtk.main_quit)
@@ -1693,7 +1798,7 @@ class Window(Gtk.Window):
 
 
 def main():
-    global S, ALWAYS_NIGHT
+    global S, W, ALWAYS_NIGHT
     ap = argparse.ArgumentParser(description='Masaüstünde duran küçük bir piksel mahalle.')
     ap.add_argument('--scale', type=int, default=S, help='her mantıksal pikselin ekran boyutu (varsayılan %(default)s)')
     ap.add_argument('--day', action='store_true', help='mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
@@ -1708,6 +1813,10 @@ def main():
         d, m = args.dogum_gunu.split('.')
         birthday = (int(d), int(m))
     S = max(1, args.scale)
+    display = Gdk.Display.get_default()
+    monitor = display.get_primary_monitor() or display.get_monitor(0)
+    S = max(1, round(S / monitor.get_scale_factor()))   # HiDPI'de pencere şişmesin
+    W = monitor.get_workarea().width // S - PANEL       # mahalle ekranın tüm genişliğini kaplar
     if args.day:
         ALWAYS_NIGHT = False
     world = World(hava.Weather(force=args.hava), sistem.System(), birthday, args.uyku * 60)
