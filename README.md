@@ -2,15 +2,22 @@
 
 Masaüstünde duran, tıklanamayan küçük bir piksel mahalle. Evler, yürüyen insanlar, köpekler, arabalar ve taşınma kamyonu; mahallenin hareketi bilgisayarın CPU/GPU yüküne ve sıcaklığına göre değişir.
 
-Soldaki iki cam tüp internet trafiğini gösterir: yeşil tüp indirme, turuncu tüp yükleme. Doluluk logaritmiktir; her çizgi 10 kat demektir (1 KB/s boş, 100 MB/s dolu).
+## Mahalle neyi gösteriyor?
 
-| Ölçüm | Mahallede |
-|---|---|
-| CPU kullanımı | Kaldırımdaki yaya sayısı |
-| GPU kullanımı | Yoldaki araba sayısı |
-| CPU sıcaklığı | Yanan pencere sayısı |
-| İndirme / yükleme | Soldaki tüplerin doluluğu |
-| Saat | Gündüz / gece ışığı |
+Mahalle, bilgisayarın o anki durumunu canlı olarak yansıtır. Değerler 2 saniyede bir güncellenir.
+
+| Mahallede gördüğün | Temsil ettiği | Nasıl okunur |
+|---|---|---|
+| 🚶 Kaldırımda yürüyen insanlar | **İşlemci (CPU) kullanımı** | %0'da sokak boş, %100'de 14 yaya |
+| 🚗 Yoldaki arabalar | **Ekran kartı (GPU) kullanımı** | %0'da yol boş, %100'de 8 araba (`nvidia-smi` gerekir) |
+| 💡 Sarı yanan pencereler | **İşlemci sıcaklığı** | 40 °C'de hepsi sönük, 110 °C'de hepsi yanık |
+| 🧪 Soldaki yeşil tüp (↓) | **İndirme hızı** | Logaritmik: boş = 1 KB/s, dolu = 100 MB/s |
+| 🧪 Soldaki turuncu tüp (↑) | **Yükleme hızı** | Tüp üzerindeki her çizgi 10 kat artış demek |
+| 🌙 Gündüz / gece ışığı | **Saat** | 07:00–18:00 gündüz, 20:30–05:30 gece |
+
+Tüplerdeki çizgiler sırasıyla 10 KB/s, 100 KB/s, 1 MB/s ve 10 MB/s'yi gösterir. Trafik arttıkça kabarcıklar da hızlanır.
+
+Taşınma kamyonu, bahçıvan ve kuşlar yalnızca süs; bir ölçümü temsil etmez.
 
 ## Gereksinimler
 

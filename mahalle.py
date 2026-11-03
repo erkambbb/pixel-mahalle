@@ -628,14 +628,13 @@ class World:
 
         for wx, wy, lit in h.windows:
             if lit:
-                if night:
-                    self.px(wx - 1, wy - 1, 7, 7, '#ffd36b', glow=True, alpha=0.18)
-                self.px(wx, wy, 5, 5, '#ffd36b', glow=True)
-                self.px(wx, wy + 3, 5, 2, '#f0b84a', glow=True)
+                self.px(wx - 1, wy - 1, 7, 7, '#ffb52e', glow=True, alpha=0.35 if night else 0.25)
+                self.px(wx, wy, 5, 5, '#ffcf3f', glow=True)
+                self.px(wx, wy + 3, 5, 2, '#ff9f1a', glow=True)
             else:
-                self.px(wx, wy, 5, 5, '#2b3a55' if night else '#bfe3f2')
+                self.px(wx, wy, 5, 5, '#1f2a40' if night else '#5f7f99')
                 if not night:
-                    self.px(wx, wy, 2, 2, '#e4f5fb')
+                    self.px(wx, wy, 2, 2, '#9dbbd0')
             self.px(wx + 2, wy, 1, 5, '#f5f5f5')
             self.px(wx, wy + 2, 5, 1, '#f5f5f5')
             self.px(wx - 1, wy + 5, 7, 1, '#f5f5f5')
@@ -651,7 +650,7 @@ class World:
                 self.px(h.x + i, GROUND - 16, 3, 3, stripe)
                 self.px(h.x + i + 1, GROUND - 13, 1, 1, stripe)
             lit = self.shop_lit[0]
-            self.px(h.x + 3, GROUND - 12, h.door - 6, 9, '#ffe9a8' if lit else '#bfe3f2', glow=lit)
+            self.px(h.x + 3, GROUND - 12, h.door - 6, 9, '#ffd85a' if lit else '#6f8fa8', glow=lit)
             if lit and night:
                 self.px(h.x + 2, GROUND - 13, h.door - 4, 11, '#ffe9a8', glow=True, alpha=0.15)
             for i in range(3):
