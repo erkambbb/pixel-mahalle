@@ -19,6 +19,25 @@ Tüplerdeki çizgiler sırasıyla 10 KB/s, 100 KB/s, 1 MB/s ve 10 MB/s'yi göste
 
 Taşınma kamyonu, bahçıvan ve kuşlar yalnızca süs; bir ölçümü temsil etmez.
 
+## Saat ve hava durumu
+
+Ekranın ortasında büyük bir LED piksel saat durur: saat, saniye çubuğu, Türkçe tarih ve Yalova'nın anlık hava durumu. Hava [Open-Meteo](https://open-meteo.com)'dan 15 dakikada bir çekilir (anahtar gerekmez), son veri `~/.cache/pixel-mahalle/hava.json`'da saklanır.
+
+Mahallenin havası da Yalova'yı izler:
+
+| Yalova'da | Mahallede |
+|---|---|
+| Açık | Yıldızlar, gerçek evresinde ay, ara sıra kayan yıldız |
+| Bulutlu | Bulut sayısı bulutluluğa göre artar |
+| Yağmur / sağanak | Damlalar, sıçramalar, şemsiyeler, su birikintileri, ıslak asfaltta lamba yansıması; şemsiyesi olmayan koşar |
+| Kar | Kar taneleri; çatılar, ağaçlar ve kaldırım yavaşça beyazlar, kar tutunca kardan adam çıkar |
+| Fırtına | Şimşek çakar, gökyüzü aydınlanır |
+| Sis | Süzülen sis bulutları, lambaların etrafında hare |
+| Rüzgâr | Ağaçlar daha çok sallanır, baca dumanı ve yağış yana yatar |
+| 8 °C altı | Herkes bere ve atkı takar |
+
+Denemek için: `./mahalle.py --hava kar` (`acik`, `parcali`, `bulutlu`, `sis`, `cisenti`, `yagmur`, `saganak`, `kar`, `firtina`). Saati kapatmak için `--saat-yok`.
+
 ## Gereksinimler
 
 - Linux (X11/Wayland, GTK 3)

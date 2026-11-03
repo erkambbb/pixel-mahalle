@@ -24,6 +24,9 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
+import hava  # noqa: E402
+import saat  # noqa: E402
+
 W, H = 220, 90       # mahallenin mantıksal piksel boyutu
 PANEL = 22           # soldaki internet tüplerinin genişliği
 S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2); HiDPI'de küçülür
@@ -77,6 +80,15 @@ MAX_CARS = 8                   # %100 GPU'da yoldaki araba sayısı
 NET_MIN, NET_MAX = 1e3, 1e8    # 1 KB/s .. 100 MB/s
 NET_SKIP = ('lo', 'veth', 'docker', 'br-', 'virbr', 'vmnet', 'tun', 'wg')
 TUBE_TOP, TUBE_BOT = 12, 85    # cam tüpün ağız ve dip satırı
+# Hava durumu süsleri
+UMBRELLAS = [hx(c) for c in ('#e74c3c', '#2980b9', '#f1c40f', '#27ae60', '#8e44ad', '#ecf0f1', '#e67e22', '#2d3436')]
+SCARVES = [hx(c) for c in ('#c0392b', '#f39c12', '#16a085', '#ecf0f1', '#8e44ad')]
+SNOW_WHITE = '#f4f7fb'
+PUDDLES = (20, 60, 116, 158, 194)             # kaldırımdaki su birikintilerinin x'i
+MOON_X, MOON_Y, MOON_R = 116, 12, 5
+SYNODIC, NEW_MOON = 29.530588853, 947182440   # ay döngüsü (gün), 6 Oca 2000 18:14 UTC yeniay
+COLD = 8                                      # bu sıcaklığın altında atkı/bere
+
 ARROWS = {
     'down': ('..#..', '..#..', '#.#.#', '.###.', '..#..'),
     'up': ('..#..', '.###.', '#.#.#', '..#..', '..#..'),
@@ -172,6 +184,16 @@ class Metrics:
                 pass
 
 
+def moon_phase(t=None):
+    """0 yeniay, 0.25 ilk dördün, 0.5 dolunay, 0.75 son dördün."""
+    return (((time.time() if t is None else t) - NEW_MOON) / 86400 / SYNODIC) % 1
+
+
+def mix(a, b, k):
+    a, b = color(a), color(b)
+    return tuple(x + (y - x) * k for x, y in zip(a, b))
+
+
 def wait(n):
     for _ in range(int(n)):
         yield
@@ -221,6 +243,8 @@ class Person:
         self.dog = None
         self.script = None
         self.kind = 'pedestrian'   # 'pedestrian' | 'mover' | 'gardener'
+        self.umbrella = random.choice(UMBRELLAS) if random.random() < 0.85 else None
+        self.scarf = random.choice(SCARVES)
 
 
 class Dog:
@@ -265,7 +289,7 @@ class Tube:
 
 
 class World:
-    def __init__(self):
+    def __init__(self, weather=None):
         self.t = 0
         self.light = 1.0
         self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
@@ -276,7 +300,21 @@ class World:
         self.birds = []
         self.smoke = []
         self.clouds = [[random.uniform(0, W), random.uniform(3, 18), random.randint(12, 22),
-                        random.uniform(0.03, 0.07)] for _ in range(3)]
+                        random.uniform(0.03, 0.07)] for _ in range(9)]
+        # hava: hedef değerlere yavaşça yaklaşan yumuşatılmış durum
+        self.weather = weather or hava.Weather(fetch=False)
+        w = self.weather
+        self.rain, self.snow, self.cloud, self.fog, self.wind = w.rain, w.snow, w.cloud, w.fog, w.windy
+        self.cover = 1.0 if w.snow else 0.0      # yerdeki kar (0..1)
+        self.wet = 1.0 if w.rain else 0.0        # ıslaklık / su birikintileri (0..1)
+        self.drops, self.splashes, self.ripples, self.flakes = [], [], [], []
+        self.flash, self.bolt, self.meteor = 0, [], None
+        rng = random.Random(11)
+        self.stars = [(rng.uniform(0, W), rng.uniform(1, 44), rng.uniform(0, 6.3), rng.uniform(0.03, 0.12),
+                       rng.random() < 0.15, rng.choice(('#ffffff', '#cfe3ff', '#fff1c9')))
+                      for _ in range(55)]
+        self.fog_blobs = [[rng.uniform(0, W + 60), rng.uniform(25, 84), rng.uniform(25, 55),
+                           rng.uniform(2, 6), rng.uniform(0.03, 0.15)] for _ in range(16)]
         self.truck = Truck()
         self.metrics = Metrics()
         self.tubes = [Tube(3, '#3ddc97', 'down'), Tube(12, '#ff9f43', 'up')]
@@ -368,6 +406,8 @@ class World:
     def run_gardener(self, p, home):
         while True:
             yield from wait(random.randint(200, 600))
+            if self.rain > 0.1 or self.snow > 0.1 or self.cover > 0.3:
+                continue   # yağmurda sulamaya gerek yok, karda bahçe uyuyor
             p.carry = 'can'
             yield from self.leave(p, home)
             yield from walk(p, home.x + 5)
@@ -460,6 +500,8 @@ class World:
         target = round(self.metrics.cpu / 100 * MAX_WALKERS)
         if walkers < target and random.random() < 0.05:
             p = Person()
+            if self.rain > 0.3 and not p.umbrella:
+                p.speed *= 1.8   # şemsiyesi olmayan koşar
             if random.random() < 0.15:
                 p.dog = Dog(-20)
             p.script = self.run_pedestrian(p)
@@ -479,11 +521,11 @@ class World:
         self.cars = [c for c in self.cars if c[0] > -20]
 
         for c in self.clouds:
-            c[0] += c[3]
+            c[0] += c[3] * (1 + self.wind * 4)
             if c[0] > W + 5:
                 c[0], c[1] = -c[2] - 5.0, random.uniform(3, 18)
 
-        if not self.birds and random.random() < 0.002 * busy:
+        if not self.birds and self.rain < 0.05 and self.snow < 0.05 and random.random() < 0.002 * busy:
             y = random.uniform(8, 26)
             self.birds = [[-5.0 - i * 6, y + (i % 2) * 3, i * 3] for i in range(random.randint(2, 4))]
         for b in self.birds:
@@ -494,10 +536,99 @@ class World:
         if self.t % 9 == 0:
             self.smoke.append([chimney.x + chimney.w - 8.0, chimney.top - 9.0, 0])
         for s in self.smoke:
-            s[0] += 0.06
-            s[1] -= 0.18
+            s[0] += 0.06 + self.wind * 0.35
+            s[1] -= 0.18 - self.wind * 0.08
             s[2] += 1
         self.smoke = [s for s in self.smoke if s[2] < 70]
+        self.step_weather()
+
+    def step_weather(self):
+        w, k = self.weather, 0.01
+        self.rain += (w.rain - self.rain) * k
+        self.snow += (w.snow - self.snow) * k
+        self.cloud += (w.cloud - self.cloud) * k
+        self.fog += (w.fog - self.fog) * k
+        self.wind += (w.windy - self.wind) * k
+        if self.snow > 0.15:
+            self.cover = min(1.0, self.cover + 0.0004 * self.snow)
+        else:
+            self.cover = max(0.0, self.cover - 0.00015)
+        if self.rain > 0.1:
+            self.wet = min(1.0, self.wet + 0.001 * self.rain)
+        else:
+            self.wet = max(0.0, self.wet - 0.0002)
+
+        # yağmur damlaları: yere (kaldırım ya da yol) inince sıçrar
+        slant = 0.15 + self.wind * 0.6
+        n = self.rain * 6
+        while n > 0:
+            if random.random() < n:
+                self.drops.append([random.uniform(-10, W + 50), random.uniform(-8, 0),
+                                   random.uniform(2.2, 3.0), random.uniform(GROUND + 1, H - 1)])
+            n -= 1
+        for d in self.drops:
+            d[1] += d[2]
+            d[0] -= d[2] * slant
+            if d[1] >= d[3] and random.random() < 0.5:
+                self.splashes.append([d[0], d[3], 0])
+        self.drops = [d for d in self.drops if d[1] < d[3]]
+        for sp in self.splashes:
+            sp[2] += 1
+        self.splashes = [sp for sp in self.splashes if sp[2] < 3]
+        if self.rain > 0.1 and self.wet > 0.3 and random.random() < self.rain * 0.6:
+            self.ripples.append([random.choice(PUDDLES) + random.uniform(1, 7), 0.0])
+        for r in self.ripples:
+            r[1] += 0.25
+        self.ripples = [r for r in self.ripples if r[1] < 3]
+
+        # kar taneleri: salınarak düşer
+        n = self.snow * 1.5
+        while n > 0:
+            if random.random() < n:
+                self.flakes.append([random.uniform(-10, W + 40), random.uniform(-4, 0), random.uniform(0.25, 0.5),
+                                    random.uniform(0, 6.3), random.uniform(GROUND - 2, H - 1), random.random() < 0.3])
+            n -= 1
+        for f in self.flakes:
+            f[1] += f[2]
+            f[0] += math.sin(self.t * 0.06 + f[3]) * 0.2 - self.wind * 0.5
+        self.flakes = [f for f in self.flakes if f[1] < f[4]]
+
+        # şimşek: çift parlama ve zikzak yıldırım
+        if self.flash:
+            self.flash -= 1
+        elif w.storm and self.rain > 0.5 and random.random() < 1 / (FPS * 7):
+            self.flash, self.bolt = 5, self.make_bolt()
+
+        # kayan yıldız: açık gecelerde ara sıra
+        if self.meteor:
+            m = self.meteor
+            m[0] += m[2]
+            m[1] += m[3]
+            m[4] -= 1
+            if m[4] <= 0:
+                self.meteor = None
+        elif self.cloud < 0.4 and self.fog < 0.3 and random.random() < 1 / (FPS * 120):
+            self.meteor = [random.uniform(40, W), random.uniform(2, 12), -random.uniform(1.5, 2.5),
+                           random.uniform(0.5, 1.0), random.randint(10, 16)]
+
+    @staticmethod
+    def make_bolt():
+        x, y, pts = random.uniform(20, W - 20), 4.0, []
+        end = random.choice((GROUND - 20, GROUND, FEET))
+        branch = None
+        while y < end:
+            pts.append((x, y))
+            x += random.choice((-1, -1, 0, 1, 1)) * (2 if random.random() < 0.15 else 1)
+            y += 1
+            if branch is None and y > 14 and random.random() < 0.1:
+                branch = (x, y)
+        if branch:
+            bx, by = branch
+            for _ in range(random.randint(5, 10)):
+                bx += random.choice((-1, 1, 1))
+                by += 1
+                pts.append((bx, by))
+        return pts
 
     # ---- çizim ----
 
@@ -536,11 +667,8 @@ class World:
 
     def draw_scene(self):
         night = self.light < 0.5
-        for cx, cy, cw, _ in self.clouds:
-            self.px(cx, cy + 2, cw, 3, '#ffffff', alpha=0.85)
-            self.px(cx + 3, cy, cw // 2, 2, '#ffffff', alpha=0.85)
-            self.px(cx + cw // 2, cy + 1, cw // 3, 1, '#ffffff', alpha=0.85)
-            self.px(cx + 1, cy + 4, cw - 2, 1, '#d6dde6', alpha=0.85)
+        cover = round(self.cover, 1)
+        self.draw_sky()
         for bx, by, ph in self.birds:
             up = (self.t // 3 + ph) % 2
             self.px(bx, by, 1, 1, '#333333')
@@ -548,15 +676,16 @@ class World:
             self.px(bx + 1, by - up, 1, 1, '#333333')
 
         lit = tuple(w[2] for h in self.houses for w in h.windows)
-        self.layer('houses', (self.light, lit, self.shop_lit[0], tuple(bool(h.open) for h in self.houses)),
-                   lambda: [self.draw_house(h, night) for h in self.houses])
+        self.layer('houses', (self.light, cover, lit, self.shop_lit[0], tuple(bool(h.open) for h in self.houses)),
+                   lambda: [(self.draw_house(h, night), self.draw_roof_snow(h, cover)) for h in self.houses])
         for sx, sy, age in self.smoke:
             size = 1 + age // 25
             self.px(sx, sy, size, size, '#d0d0d0', alpha=max(0.0, 0.8 - age / 90))
         for i, tx in enumerate(TREES):
             self.draw_tree(tx, i)
 
-        self.layer('ground', self.light, lambda: self.draw_ground(night))
+        self.layer('ground', (self.light, cover), lambda: self.draw_ground(night, cover))
+        self.draw_puddles()
 
         for p in self.people:
             if p.visible:
@@ -565,13 +694,149 @@ class World:
             if p.dog and p.visible:
                 self.draw_dog(p.dog, p)
 
-        self.layer('road', self.light, self.draw_road)
+        self.layer('road', (self.light, round(self.wet, 1), cover), self.draw_road)
         self.draw_truck(night)
         for cx, _, c in self.cars:
             self.draw_car(cx, c, night)
-        self.layer('lamps', self.light, lambda: [self.draw_lamp(lx, night) for lx in LAMPS])
+        self.layer('lamps', (self.light, cover, round(self.fog, 1)),
+                   lambda: [self.draw_lamp(lx, night) for lx in LAMPS])
+        self.draw_weather()
 
-    def layer(self, name, key, draw, shift=True):
+    def draw_sky(self):
+        dark = max(0.0, 1 - self.light * 2)          # yıldız ve ay yalnızca gece
+        vis = dark * (1 - self.cloud) * (1 - self.fog)
+        if vis > 0.02:
+            for x, y, ph, sp, big, c in self.stars:
+                a = vis * (0.3 + 0.35 * (1 + math.sin(self.t * sp + ph)))
+                if big:
+                    self.px(x, y, 1, 1, c, glow=True, alpha=a)
+                    self.px(x - 0.5, y + 0.25, 2, 0.5, c, glow=True, alpha=a * 0.4)
+                    self.px(x + 0.25, y - 0.5, 0.5, 2, c, glow=True, alpha=a * 0.4)
+                else:
+                    self.px(x, y, 0.5, 0.5, c, glow=True, alpha=a)
+            if self.meteor:
+                mx, my, vx, vy, life = self.meteor
+                for i in range(8):
+                    self.px(mx - vx * i * 0.5, my - vy * i * 0.5, 0.5, 0.5, '#ffffff', glow=True,
+                            alpha=vis * (1 - i / 8) * min(1.0, life / 4))
+        moon = dark * (1 - self.cloud * 0.85) * (1 - self.fog * 0.6)
+        if moon > 0.02:
+            phase = round(moon_phase(), 2)
+            self.layer('moon', phase, lambda: self.draw_moon(phase), alpha=moon)
+
+        # bulutlar: sayısı bulutluluğa göre, yağmurda koyulaşır, şimşekte aydınlanır
+        dark_k = min(1.0, self.rain * 1.3 + self.snow * 0.3)
+        base = mix('#ffffff', '#4a5160', dark_k)
+        lit = self.flash in (5, 3)
+        for i, (cx, cy, cw, _) in enumerate(self.clouds):
+            a = max(0.0, min(1.0, self.cloud * 9 - i)) * 0.85
+            if a <= 0:
+                continue
+            top, bottom = (mix(base, '#dfe8ff', 0.6), base) if lit else (base, shade(base, 0.82))
+            self.px(cx, cy + 2, cw, 3, top, glow=lit, alpha=a)
+            self.px(cx + 3, cy, cw // 2, 2, top, glow=lit, alpha=a)
+            self.px(cx + cw // 2, cy + 1, cw // 3, 1, top, glow=lit, alpha=a)
+            self.px(cx + 1, cy + 4, cw - 2, 1, bottom, glow=lit, alpha=a)
+
+    def draw_moon(self, phase):
+        """Gerçek ay evresi: aydınlık kısım, sönük kısım ve birkaç krater."""
+        cx, cy, r = MOON_X, MOON_Y, MOON_R
+        self.glow(cx, cy, r + 5, '#f4f1de', 0.03)
+        c = math.cos(2 * math.pi * phase)
+
+        def lit_span(yc):
+            half = math.sqrt(max(0.0, r * r - yc * yc))
+            a, b = (half * c, half) if phase < 0.5 else (-half, -half * c)
+            return half, round(a * 2) / 2, round(b * 2) / 2
+
+        y = -r
+        while y < r:
+            half, a, b = lit_span(y + 0.25)
+            hw = round(half * 2) / 2
+            if hw:
+                self.px(cx - hw, cy + y, 2 * hw, 0.5, '#1c2130', glow=True, alpha=0.95)
+            if b > a:
+                self.px(cx + a, cy + y, b - a, 0.5, '#f4f1de', glow=True)
+            y += 0.5
+        for dx, dy, size in ((-2, -1.5, 1), (1, 1, 1.5), (-1, 2, 0.5), (2, -2.5, 0.5)):
+            _, a, b = lit_span(dy + 0.25)
+            if a <= dx and dx + size <= b:
+                self.px(cx + dx, cy + dy, size, size, '#cfc9ae', glow=True)
+
+    def draw_puddles(self):
+        if self.wet < 0.05:
+            return
+        a = self.wet
+        for x in PUDDLES:
+            self.px(x + 1, FEET + 0.5, 6, 0.5, '#1d2738', glow=True, alpha=0.8 * a)
+            self.px(x, FEET + 1, 8, 0.5, '#1d2738', glow=True, alpha=0.8 * a)
+            if self.light < 0.5 and any(abs(x + 4 - lx) < 12 for lx in LAMPS):
+                self.px(x + 3, FEET + 0.5, 2, 1, '#ffe08a', glow=True, alpha=0.45 * a)
+        for rx, age in self.ripples:
+            ra = 0.6 * (1 - age / 3) * a
+            self.px(rx - age * 0.5, FEET + 0.5, 0.5, 0.5, '#9fc4e8', glow=True, alpha=ra)
+            self.px(rx + age * 0.5, FEET + 0.5, 0.5, 0.5, '#9fc4e8', glow=True, alpha=ra)
+
+    def draw_weather(self):
+        for x, y, _, _ in self.drops:
+            a, c = 0.32, '#9cc3e6'
+            for lx in LAMPS:   # lamba ışığına giren damla parlar
+                if 52 < y < FEET and abs(x - lx) < 2 + (y - 52) * 0.45:
+                    a, c = 0.75, '#ffe9a8'
+                    break
+            self.px(x, y, 0.5, 1.5, c, glow=True, alpha=a)
+        for x, y, age in self.splashes:
+            self.px(x - 0.5 - age * 0.5, y - 0.5 - (age == 1) * 0.5, 0.5, 0.5, '#bcd7ef', glow=True, alpha=0.5)
+            self.px(x + 0.5 + age * 0.5, y - 0.5 - (age == 1) * 0.5, 0.5, 0.5, '#bcd7ef', glow=True, alpha=0.5)
+        for x, y, _, _, _, big in self.flakes:
+            size = 1 if big else 0.5
+            self.px(x, y, size, size, '#ffffff', glow=True, alpha=0.85)
+        if self.fog > 0.02:
+            self.px(0, 0, W, H, '#8090a0', glow=True, alpha=0.05 * self.fog)
+            for x0, y, w, h, sp in self.fog_blobs:
+                x = (x0 + self.t * sp) % (W + 60) - 30
+                for k in range(3):   # uçları yuvarlanmış, ortası yoğun bulut şerit
+                    inset = k * w * 0.18
+                    self.px(x + inset, y + k * h / 6, w - 2 * inset, h - k * h / 3, '#aab4c3',
+                            glow=True, alpha=0.03 * self.fog)
+        if self.flash:
+            self.px(0, 0, W, H, '#dfe8ff', glow=True, alpha=(0.22, 0.05, 0.3, 0.1, 0.04)[5 - self.flash])
+            if self.flash in (5, 3):
+                for bx, by in self.bolt:
+                    self.px(bx - 1, by, 3, 1, '#bcd0ff', glow=True, alpha=0.3)
+                    self.px(bx, by, 1, 1, '#ffffff', glow=True)
+
+    def draw_roof_snow(self, h, cover):
+        if not cover:
+            return
+        if h.kind == 'gable':
+            rows = min(10, (h.w + 4) // 2 - 1)
+            for i in range(rows):   # her basamağın açıkta kalan iki köşesi
+                self.px(h.x - 2 + i, h.top - 1.5 - i, 1, 0.5, SNOW_WHITE, alpha=cover)
+                self.px(h.x + h.w + 1 - i, h.top - 1.5 - i, 1, 0.5, SNOW_WHITE, alpha=cover)
+            self.px(h.x - 3 + rows, h.top - rows - 0.5, h.w + 6 - 2 * rows, 1, SNOW_WHITE, alpha=cover)
+            if h is self.houses[0]:
+                self.px(h.x + h.w - 10, h.top - 10.5, 5, 0.5, SNOW_WHITE, alpha=cover)
+        else:
+            self.px(h.x - 1, h.top - 3, h.w + 2, 1, SNOW_WHITE, alpha=cover)
+        if h.kind == 'shop':
+            self.px(h.x, GROUND - 16.5, h.w, 0.5, SNOW_WHITE, alpha=cover)
+
+    def draw_snowman(self, x):
+        g = GROUND
+        self.px(x + 1, g - 4, 3, 1, SNOW_WHITE)
+        self.px(x, g - 3, 5, 3, SNOW_WHITE)
+        self.px(x + 1, g - 7, 3, 3, SNOW_WHITE)
+        self.px(x + 1, g - 9, 3, 1.5, '#222222')
+        self.px(x + 0.5, g - 7.5, 4, 0.5, '#222222')
+        self.px(x + 1.5, g - 6, 0.5, 0.5, '#222222')
+        self.px(x + 3, g - 6, 0.5, 0.5, '#222222')
+        self.px(x + 3.5, g - 5.5, 1, 0.5, '#e67e22')
+        self.px(x + 1, g - 4, 3, 0.5, '#c0392b')
+        self.px(x + 2.25, g - 2.5, 0.5, 0.5, '#222222')
+        self.px(x + 2.25, g - 1.5, 0.5, 0.5, '#222222')
+
+    def layer(self, name, key, draw, shift=True, alpha=1.0):
         """Değişmeyen katmanı bir kez yüzeye çizer, anahtar değişene kadar yüzeyi basar."""
         ent = self.layers.get(name)
         if ent is None or ent[0] != key:
@@ -592,10 +857,10 @@ class World:
         ctx.identity_matrix()
         ctx.set_source_surface(ent[1], 0, 0)
         ctx.get_source().set_filter(cairo.FILTER_NEAREST)
-        ctx.paint()
+        ctx.paint_with_alpha(alpha)
         ctx.restore()
 
-    def draw_ground(self, night):
+    def draw_ground(self, night, cover=0.0):
         # çimen, çiçekler, kaldırım
         self.px(0, GROUND, W, 1, '#7fb069')
         for x in self.tufts:
@@ -616,6 +881,14 @@ class World:
                             alpha=0.11 - i * 0.002)
                 self.px(lx - 7, FEET, 15, 1.5, '#ffe08a', glow=True, alpha=0.12)
 
+        if cover:
+            self.px(0, GROUND - 0.5, W, 1.5, SNOW_WHITE, alpha=cover)
+            rng = random.Random(5)
+            for _ in range(int(160 * cover)):
+                self.px(rng.uniform(0, W), rng.uniform(GROUND + 1, FEET + 1), 1, 0.5, SNOW_WHITE, alpha=0.8)
+            if cover >= 0.7:
+                self.draw_snowman(0)
+
     def draw_road(self):
         # bordür ve yol
         self.px(0, FEET + 2, W, 1, '#e2ded6')
@@ -623,6 +896,19 @@ class World:
         self.px(0, FEET + 4, W, H - FEET - 4, '#4a4a52')
         for dx in range(0, W, 10):
             self.px(dx, 82, 6, 1, '#e8e1a0')
+        wet, cover = round(self.wet, 1), round(self.cover, 1)
+        if wet:   # ıslak asfalt: koyu parlaklık ve lamba yansımaları
+            self.px(0, FEET + 4, W, H - FEET - 4, '#2a3550', alpha=wet * 0.35)
+            if self.light < 0.5:
+                for lx in LAMPS:
+                    for i in range(10):
+                        self.px(lx - 1 + (i % 2) * 0.5, FEET + 4 + i, 2.5, 1, '#ffe08a', glow=True,
+                                alpha=wet * 0.22 * (1 - i / 10))
+        if cover:
+            self.px(0, FEET + 4, W, 1, SNOW_WHITE, alpha=cover * 0.8)
+            rng = random.Random(6)
+            for _ in range(int(40 * cover)):
+                self.px(rng.uniform(0, W), FEET + 5 + rng.random() * 2, 1, 0.5, SNOW_WHITE, alpha=0.6)
 
     def draw_tubes(self):
         night = self.light < 0.5
@@ -748,7 +1034,7 @@ class World:
         self.px(h.door_x - 1, GROUND, 7, 1, '#9e978a')
 
     def draw_tree(self, tx, i):
-        sway = round(math.sin(self.t * 0.08 + i * 1.7) * 0.6)
+        sway = round(math.sin(self.t * (0.08 + self.wind * 0.12) + i * 1.7) * (0.6 + self.wind * 1.6))
         self.px(tx - 1, GROUND - 1, 8, 1, '#000000', alpha=0.15)
         self.px(tx + 2, GROUND - 6, 2, 6, '#6b4423')
         self.px(tx + 3, GROUND - 6, 1, 6, '#523319')
@@ -762,15 +1048,24 @@ class World:
         self.px(x + 1, GROUND - 15, 2, 1, light)
         self.px(x, GROUND - 13, 2, 2, light)
         self.px(x + 4, GROUND - 12, 1, 1, '#c0392b')
+        if self.cover > 0.05:
+            for sx, sy, sw in ((x + 1, GROUND - 16, 4), (x, GROUND - 14, 1), (x + 5, GROUND - 14, 1),
+                               (x - 1, GROUND - 12, 1), (x + 6, GROUND - 12, 1)):
+                self.px(sx, sy - 0.5, sw, 1, SNOW_WHITE, alpha=self.cover)
 
     def draw_lamp(self, lx, night):
         self.px(lx - 1, FEET + 1, 3, 1, '#2a2a2a')
         self.px(lx, 55, 1, FEET + 1 - 55, '#3a3a3a')
         self.px(lx - 2, 53, 5, 1, '#2a2a2a')
         self.px(lx - 1, 52, 3, 1, '#2a2a2a')
+        if self.cover > 0.05:
+            self.px(lx - 1, 51.5, 3, 0.5, SNOW_WHITE, alpha=round(self.cover, 1))
         if night:
             self.px(lx - 1, 54, 3, 1, '#fff6c8', glow=True)
             self.glow(lx + 0.5, 54.5, 6, '#ffe08a', 0.07)
+            fog = round(self.fog, 1)
+            if fog:
+                self.glow(lx + 0.5, 54.5, 12, '#ffe08a', 0.035 * fog)
             self.px(lx - 0.5, 54, 2, 0.5, '#ffffff', glow=True)
         else:
             self.px(lx - 1, 54, 3, 1, '#d8d2b0')
@@ -806,6 +1101,30 @@ class World:
             if p.watering:
                 for i in range(3):
                     self.px(spout, top + 5 + (self.t + i * 2) % 4, 1, 1, '#5dade2')
+        temp = self.weather.temp
+        if self.snow > 0.2 or self.cover > 0.3 or (temp is not None and temp < COLD):
+            self.px(x, top - 0.5, 4, 1, p.scarf)                       # bere
+            self.px(x + 1.5, top - 1, 1, 0.5, '#ffffff')               # ponpon
+            self.px(x, top + 3, 4, 1, shade(p.scarf, 0.9))             # atkı
+            self.px(x - 0.5 if p.dir > 0 else x + 4, top + 3.5, 0.5, 1.5, p.scarf)
+        if self.rain > 0.2 and p.carry != 'box':
+            if p.umbrella:
+                self.draw_umbrella(p, x, top)
+            else:   # ceketi başına çekmiş
+                self.px(x - 0.5, top - 1, 5, 1, p.shirt)
+                self.px(x - 0.5, top, 0.5, 2.5, p.shirt)
+                self.px(x + 4, top, 0.5, 2.5, p.shirt)
+
+    def draw_umbrella(self, p, x, top):
+        c, ux = p.umbrella, x + 2
+        self.px(ux + (0.5 if p.dir > 0 else -1), top - 3, 0.5, 6, '#3a3a3a')   # sap
+        self.px(ux - 4, top - 3, 8, 1, c)
+        self.px(ux - 3, top - 4, 6, 1, c)
+        self.px(ux - 1.5, top - 5, 3, 1, c)
+        self.px(ux - 3, top - 4, 2, 0.5, shade(c, 1.35))                       # parlama
+        for ex in (ux - 4, ux - 0.5, ux + 3):                                  # tel uçları
+            self.px(ex, top - 2, 1, 0.5, shade(c, 0.7))
+        self.px(ux - 0.25, top - 6, 0.5, 1, '#d0d0d0')
 
     def draw_dog(self, d, owner):
         x, y = d.x, FEET - 3
@@ -870,13 +1189,13 @@ class World:
 
 
 class Window(Gtk.Window):
-    def __init__(self):
+    def __init__(self, weather=None):
         global S
         super().__init__(title='Piksel Mahalle')
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         S = max(1, round(S / monitor.get_scale_factor()))   # HiDPI'de pencere şişmesin
-        self.world = World()
+        self.world = World(weather)
         self.world.update_light()
         self.set_decorated(False)
         self.set_app_paintable(True)
@@ -922,13 +1241,19 @@ def main():
     ap = argparse.ArgumentParser(description='Masaüstünde duran küçük bir piksel mahalle.')
     ap.add_argument('--scale', type=int, default=S, help='her mantıksal pikselin ekran boyutu (varsayılan %(default)s)')
     ap.add_argument('--day', action='store_true', help='mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
+    ap.add_argument('--hava', choices=sorted(hava.FORCE), help='Yalova yerine bu havayı göster (deneme için)')
+    ap.add_argument('--saat-yok', action='store_true', help='ortadaki saati gösterme')
     args = ap.parse_args()
     S = max(1, args.scale)
     if args.day:
         ALWAYS_NIGHT = False
-    win = Window()
-    win.show_all()
-    win.input_shape_combine_region(cairo.Region())  # tıklamalar içinden geçsin
+    weather = hava.Weather(force=args.hava)
+    wins = [Window(weather)]
+    if not args.saat_yok:
+        wins.append(saat.ClockWindow(weather))
+    for win in wins:
+        win.show_all()
+        win.input_shape_combine_region(cairo.Region())  # tıklamalar içinden geçsin
     Gtk.main()
 
 
