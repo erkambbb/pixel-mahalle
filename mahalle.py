@@ -87,19 +87,25 @@ TEMP_MIN, TEMP_MAX = 40, 110   # bu aralıkta pencereler 0'dan hepsine kadar yan
 GPU_COOL, GPU_HOT = 45, 85     # GPU bu sıcaklıklar arasında bacalar sakinden kıpkırmızıya
 MAX_WALKERS = 14               # %100 CPU'da 220 px'lik sokaktaki yaya sayısı (genişlikle ölçeklenir)
 MAX_CARS = 8                   # %100 GPU'da 220 px'lik yoldaki araba sayısı
+TOWER_W, TOWER_TOP = 16, 24    # saat kulesi gövdesi: genişlik ve gövdenin üst satırı
 
 
 def layout(width):
     """Evler, ağaçlar, lambalar ve su birikintileri: ilk beşi sabit, gerisi genişliği doldurur."""
     rng = random.Random(21)
     houses, trees = [dict(d) for d in HOUSES], list(TREES)
-    x, i = 224, 0
+    # saat kulesi: geniş ekranda ortaya, ilk beş evin hemen sağından önce değil
+    tower = max(218, width // 2 - TOWER_W // 2) if width >= 300 else None
+    x, i = (tower + TOWER_W + 10) if tower else 224, 0
     while True:
         t = EXTRA[i % len(EXTRA)]
         i += 1
         w = t['w'] + rng.choice((-2, 0, 2))
         if x + w > width - 4:
             break
+        if tower and x < tower + TOWER_W + 4 and x + w > tower - 4:   # kulenin yerine taşma
+            x = tower + TOWER_W + 10
+            continue
         if t['kind'] == 'gable':
             chimney = rng.choice((6, w - 9))
         else:
@@ -114,7 +120,7 @@ def layout(width):
         x += gap
     lamps = LAMPS + list(range(285, width - 10, 85))
     puddles = PUDDLES + tuple(range(234, width - 10, 40))
-    return houses, trees, lamps, puddles
+    return houses, trees, lamps, puddles, tower
 
 # İnternet tüpleri: doluluk logaritmik, NET_MIN'de boş, NET_MAX'ta dolu (bayt/sn)
 NET_MIN, NET_MAX = 1e3, 1e8    # 1 KB/s .. 100 MB/s
@@ -408,10 +414,11 @@ class World:
         self.cats = []
         self.light = 1.0
         self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
-        houses, self.trees, self.lamps, self.puddles = layout(W)
+        houses, self.trees, self.lamps, self.puddles, self.tower = layout(W)
+        self.ring_hour = None              # son çan çalınan saat
         self.houses = [House(d) for d in houses]
         self.scale = W / 220               # nüfus, bulut, yağış genişlikle ölçeklenir
-        self.moon_x = round(W * 0.53)
+        self.moon_x = round(W * (0.68 if self.tower else 0.53))
         self.heat = 0.0                    # GPU sıcaklığı 0..1 (yumuşatılmış)
         self.shop = self.houses[2]
         self.people = []
@@ -444,7 +451,8 @@ class World:
         # Evlerin önünde kalmayan çimen tutamları
         rng = random.Random(3)
         self.tufts = [x for x in range(0, W, 3)
-                      if rng.random() < 0.6 and not any(h.x - 1 <= x <= h.x + h.w for h in self.houses)]
+                      if rng.random() < 0.6 and not any(h.x - 1 <= x <= h.x + h.w for h in self.houses)
+                      and not (self.tower and self.tower - 1 <= x <= self.tower + TOWER_W)]
         self.truck_script = self.run_truck()
         for i in range(2):
             m = Person(self.houses[3].door_x + i * 8)
@@ -813,6 +821,12 @@ class World:
         self.smoke = [s for s in self.smoke if s[2] < (25 if s[4] else 70 + 40 * s[3])]
         self.step_weather()
         self.step_life()
+        if self.tower:
+            now = self.clock()
+            if now.minute == 0 and now.hour != self.ring_hour:   # saat başı: güvercinler havalanır
+                self.ring_hour = now.hour
+                cx = self.tower + TOWER_W / 2
+                self.birds = [[cx + i * 3.0, 14.0 - (i % 2) * 2, i * 3] for i in range(random.randint(3, 5))]
 
     def step_life(self):
         for c in self.cats:
@@ -1005,6 +1019,9 @@ class World:
         lit = tuple(w[2] for h in self.houses for w in h.windows)
         self.layer('houses', (self.light, cover, lit, self.shop_lit[0], tuple(bool(h.open) for h in self.houses)),
                    lambda: [(self.draw_house(h, night), self.draw_roof_snow(h, cover)) for h in self.houses])
+        if self.tower:
+            self.layer('tower', (self.light, cover), lambda: self.draw_tower(night, cover))
+            self.draw_tower_clock(night)
         self.draw_decor(night)
         self.draw_battery_sign(self.shop)
         self.draw_music_window()
@@ -1256,6 +1273,96 @@ class World:
         self.px(wx, wy, 5, 5, tuple(v * beat for v in c), glow=True)
         self.px(wx + 2.25, wy, 0.5, 5, '#f5f5f5')
         self.px(wx, wy + 2.25, 5, 0.5, '#f5f5f5')
+
+    def draw_tower(self, night, cover):
+        """Saat kulesinin değişmeyen kısmı: taş gövde, çan odası, bakır çatı, kadran."""
+        x, top = self.tower, TOWER_TOP
+        stone, dark, light = '#b9a58a', '#8f7d64', '#d8c7a8'
+        self.px(x, top, TOWER_W, GROUND - top, stone)
+        self.px(x + TOWER_W - 2, top, 2, GROUND - top, dark)
+        for y in range(top + 4, GROUND, 5):                            # taş sıraları
+            self.px(x, y, TOWER_W, 0.5, dark)
+            off = 3 if (y // 5) % 2 else 6
+            for sx in range(int(x) + off, int(x) + TOWER_W - 2, 6):
+                self.px(sx, y - 4.5, 0.5, 4.5, dark)
+        self.px(x - 1, top - 1, TOWER_W + 2, 1.5, light)                # korniş
+        self.px(x - 1, 40, TOWER_W + 2, 1, light)
+        self.px(x - 1, GROUND - 2, TOWER_W + 2, 2, dark)                # kaide
+        # kemerli kapı ve dar pencere
+        self.px(x + 5, GROUND - 9, 6, 9, '#4a2e1e')
+        self.px(x + 6, GROUND - 10, 4, 1, '#4a2e1e')
+        self.px(x + 4, GROUND - 10, 8, 0.5, light)
+        self.px(x + 7.75, GROUND - 9, 0.5, 9, '#2e1c12')
+        self.px(x + 7, 44, 2, 5, '#ffcf6b' if night else '#2a2230', glow=night, alpha=0.9)
+        self.px(x + 7, 43, 2, 1, light)
+        # çan odası: iki sütun arasında kemer
+        bt = top - 10
+        self.px(x, bt, TOWER_W, 9, stone)
+        self.px(x + 3, bt + 1, TOWER_W - 6, 8, '#1d1824')
+        self.px(x + 4, bt + 0.5, TOWER_W - 8, 0.5, '#1d1824')
+        if night:
+            self.px(x + 3, bt + 1, TOWER_W - 6, 8, '#ffcf6b', glow=True, alpha=0.12)
+        self.px(x - 1, bt - 1, TOWER_W + 2, 1, light)
+        # bakır (yeşil pas) basamaklı çatı ve tepelik
+        roof, roof_hi = '#4f8a76', '#6fb39a'
+        rt = bt - 2
+        for i in range(8):
+            w = TOWER_W + 2 - 2 * i
+            self.px(x - 1 + i, rt - i, w, 1, roof if i % 2 else shade(roof, 0.88))
+            self.px(x - 1 + i, rt - i, 1, 1, roof_hi)
+            if cover:
+                self.px(x - 1 + i, rt - i - 0.5, 1, 0.5, SNOW_WHITE, alpha=cover)
+                self.px(x + TOWER_W - i, rt - i - 0.5, 1, 0.5, SNOW_WHITE, alpha=cover)
+        cx = x + TOWER_W / 2
+        self.px(cx - 0.25, rt - 12, 0.5, 5, '#c9a227', glow=night)
+        self.px(cx - 0.75, rt - 12.5, 1.5, 1, '#e0b83a', glow=night)
+        # kadran: krem disk, koyu çerçeve, saat çizgileri
+        fx, fy, r = cx, top + 7.5, 5.5
+        if night:
+            self.glow(fx, fy, r + 4, '#ffe9b0', 0.05)
+        y = -r
+        while y < r:
+            half = round(math.sqrt(max(0.0, r * r - (y + 0.25) ** 2)) * 2) / 2
+            if half:
+                self.px(fx - half - 0.5, fy + y, 2 * half + 1, 0.5, '#3a2f25')
+                self.px(fx - half + 0.5, fy + y, max(0.0, 2 * half - 1), 0.5, '#f4ecd8', glow=night)
+            y += 0.5
+        for k in range(12):
+            a = k / 12 * 2 * math.pi
+            size = 1 if k % 3 == 0 else 0.5
+            self.px(fx + math.sin(a) * 4 - size / 2, fy - math.cos(a) * 4 - size / 2, size, size, '#3a2f25')
+
+    def draw_tower_clock(self, night):
+        """Akrep, yelkovan, saniye ibresi ve saat başı sallanan çan."""
+        now = self.clock()
+        cx = self.tower + TOWER_W / 2
+        fx, fy = cx, TOWER_TOP + 7.5
+        hours = now.hour % 12 + now.minute / 60
+        mins = now.minute + now.second / 60
+        for angle, length, c in ((hours / 12, 2.8, '#1e1a16'), (mins / 60, 4.2, '#1e1a16'),
+                                 (now.second / 60, 4.2, '#d63031')):
+            a = angle * 2 * math.pi
+            r = 0.0
+            while r <= length:
+                self.px(fx + math.sin(a) * r - 0.25, fy - math.cos(a) * r - 0.25, 0.5, 0.5, c)
+                r += 0.5
+        self.px(fx - 0.5, fy - 0.5, 1, 1, '#c9a227')
+        # çan: saat başında saat sayısı kadar sallanır, ses halkaları yayılır
+        dongs = now.hour % 12 or 12
+        ringing = now.minute == 0 and now.second < dongs * 1.5
+        swing = math.sin(self.t * 0.55) * 0.7 if ringing else 0.0
+        bt = TOWER_TOP - 10
+        for i, (w, y) in enumerate(((1, bt + 2), (2, bt + 2.5), (3, bt + 3), (3, bt + 4), (4, bt + 5), (5, bt + 6))):
+            off = swing * i * 0.6
+            self.px(cx - w / 2 + off, y, w, 0.5 if i < 3 else 1, '#d4a72c', glow=night)
+        self.px(cx - 0.25 + swing * 4.5, bt + 7, 0.5, 0.5, '#8a6a1c', glow=night)
+        if ringing:
+            k = (self.t % 18) / 18
+            for side in (-1, 1):
+                rx = cx + side * (TOWER_W / 2 + 1 + k * 6)
+                for dy in (-1, 0, 1):
+                    self.px(rx - side * abs(dy) * 0.5, bt + 4 + dy * 1.5, 0.5, 1, '#ffe9b0', glow=True,
+                            alpha=0.7 * (1 - k))
 
     def draw_chimney_heat(self):
         """GPU çok ısınınca baca ağızları kor gibi parlar."""

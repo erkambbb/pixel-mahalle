@@ -47,6 +47,7 @@ Mahallenin havası da Yalova'yı izler:
 
 ## Mahalle hayatı
 
+- **Saat kulesi:** Geniş ekranda mahallenin ortasında durur. Kadranında gerçek saat görünür (akrep, yelkovan ve kırmızı saniye ibresi), gece kadran ışır. Saat başlarında çan, saat kaçsa o kadar sallanır, ses halkaları yayılır ve kuleden güvercinler havalanır.
 - **Pil tabelası:** Dükkân tabelası pil göstergesine dönüşür ve yüzdeyi gösterir. Fişe takılıyken yanında kablo ve fiş, içinde şimşek çıkar.
 - **Uyku:** 5 dakika klavye ve fareye dokunulmazsa (`--uyku DK`) ışıklar tek tek söner, millet evine girer, evlerden Zzz yükselir. Ağaçta baykuş belirir, çatıdaki kedi kıvrılıp uyur, saat kısılır. Dokununca hepsi uyanır.
 - **Özel günler:**

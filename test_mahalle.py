@@ -120,5 +120,30 @@ class LifeTest(unittest.TestCase):
         self.assertTrue(fired)
 
 
+class WideTest(unittest.TestCase):
+    def test_full_width_layout_with_tower(self):
+        houses, trees, lamps, puddles, tower = m.layout(452)
+        self.assertIsNotNone(tower)
+        for h in houses:   # evler sahneye sığar ve kuleyle çakışmaz
+            self.assertLessEqual(h['x'] + h['w'], 452)
+            self.assertFalse(h['x'] < tower + m.TOWER_W and h['x'] + h['w'] > tower)
+        self.assertIsNone(m.layout(220)[4])
+
+    def test_tower_rings_on_the_hour(self):
+        old = m.W
+        m.W = 452
+        try:
+            w = m.World(hava.Weather(fetch=False), sistem.System(music=False),
+                        clock=lambda: datetime.datetime(2026, 11, 3, 21, 0, 2))
+            w.step()
+            self.assertEqual(w.ring_hour, 21)
+            self.assertTrue(w.birds)
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, (m.PANEL + m.W) * m.S, m.H * m.S)
+            w.draw(cairo.Context(surf))
+            self.assertIn('tower', w.layers)
+        finally:
+            m.W = old
+
+
 if __name__ == '__main__':
     unittest.main()
