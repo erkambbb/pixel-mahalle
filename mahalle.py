@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Masaüstünde duran, tıklanamayan küçük bir piksel mahalle."""
 import datetime
+import functools
+import glob
 import math
 import random
+import shutil
 import subprocess
+import time
 
 import cairo
 import gi
@@ -12,7 +16,8 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-W, H = 220, 90       # mantıksal piksel
+W, H = 220, 90       # mahallenin mantıksal piksel boyutu
+PANEL = 22           # soldaki internet tüplerinin genişliği
 S = 3                # her mantıksal piksel ekranda S x S
 FPS = 12
 GROUND = 66          # evlerin oturduğu çizgi (çimen satırı)
@@ -21,9 +26,23 @@ PICKUP_X = 140       # taşıyıcıların kamyondan kutu aldığı yer
 TRUCK_X = 146        # kamyonun park ettiği yer
 
 
+@functools.lru_cache(maxsize=None)
 def hx(s):
     s = s.lstrip('#')
     return tuple(int(s[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def color(c):
+    return hx(c) if isinstance(c, str) else c
+
+
+def shade(c, k):
+    return tuple(min(1.0, v * k) for v in color(c))
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
 
 
 SKIN = [hx(c) for c in ('#f1c27d', '#e0ac69', '#c68642', '#8d5524', '#ffdbac')]
@@ -45,28 +64,57 @@ TEMP_MIN, TEMP_MAX = 40, 110   # bu aralıkta pencereler 0'dan hepsine kadar yan
 MAX_WALKERS = 14               # %100 CPU'da yoldaki yaya sayısı
 MAX_CARS = 8                   # %100 GPU'da yoldaki araba sayısı
 
+# İnternet tüpleri: doluluk logaritmik, NET_MIN'de boş, NET_MAX'ta dolu (bayt/sn)
+NET_MIN, NET_MAX = 1e3, 1e8    # 1 KB/s .. 100 MB/s
+NET_SKIP = ('lo', 'veth', 'docker', 'br-', 'virbr', 'vmnet', 'tun', 'wg')
+TUBE_TOP, TUBE_BOT = 12, 85    # cam tüpün ağız ve dip satırı
+ARROWS = {
+    'down': ('..#..', '..#..', '#.#.#', '.###.', '..#..'),
+    'up': ('..#..', '.###.', '#.#.#', '..#..', '..#..'),
+}
+
 
 class Metrics:
-    """CPU %, GPU % ve CPU sıcaklığı."""
+    """CPU %, GPU %, CPU sıcaklığı ve ağ trafiği (bayt/sn)."""
 
     def __init__(self):
         self.cpu = self.gpu = 0.0
         self.temp = TEMP_MIN
+        self.down = self.up = 0.0
         self._prev = self._cpu_times()
+        self._net_prev = (time.monotonic(), *self._net_bytes())
+        self._nvidia = shutil.which('nvidia-smi') is not None
         self._temp_file = None
-        import glob
         for d in glob.glob('/sys/class/hwmon/hwmon*'):
             try:
-                if open(d + '/name').read().strip() in ('coretemp', 'k10temp', 'zenpower'):
+                if read(d + '/name').strip() in ('coretemp', 'k10temp', 'zenpower'):
                     self._temp_file = d + '/temp1_input'
             except OSError:
                 pass
 
     @staticmethod
     def _cpu_times():
-        v = [int(x) for x in open('/proc/stat').readline().split()[1:]]
-        idle = v[3] + v[4]
-        return idle, sum(v)
+        with open('/proc/stat') as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return v[3] + v[4], sum(v)
+
+    @staticmethod
+    def _net_bytes():
+        """Fiziksel arayüzlerin toplam alınan/gönderilen baytı."""
+        rx = tx = 0
+        try:
+            lines = read('/proc/net/dev').splitlines()[2:]
+        except OSError:
+            return 0, 0
+        for line in lines:
+            name, _, data = line.partition(':')
+            if name.strip().startswith(NET_SKIP):
+                continue
+            v = data.split()
+            if len(v) >= 9:
+                rx += int(v[0])
+                tx += int(v[8])
+        return rx, tx
 
     def update(self):
         idle, total = self._cpu_times()
@@ -74,15 +122,26 @@ class Metrics:
         self._prev = (idle, total)
         if dt:
             self.cpu = 100 * (1 - di / dt)
-        try:
-            out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
-                                 capture_output=True, text=True, timeout=1).stdout
-            self.gpu = float(out.split()[0])
-        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-            self.gpu = 0.0
+
+        now = time.monotonic()
+        rx, tx = self._net_bytes()
+        t0, rx0, tx0 = self._net_prev
+        self._net_prev = (now, rx, tx)
+        if now > t0:
+            self.down = max(0, rx - rx0) / (now - t0)
+            self.up = max(0, tx - tx0) / (now - t0)
+
+        if self._nvidia:
+            try:
+                out = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu',
+                                      '--format=csv,noheader,nounits'],
+                                     capture_output=True, text=True, timeout=1).stdout
+                self.gpu = float(out.split()[0])
+            except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                self.gpu = 0.0
         if self._temp_file:
             try:
-                self.temp = int(open(self._temp_file).read()) / 1000
+                self.temp = int(read(self._temp_file)) / 1000
             except (OSError, ValueError):
                 pass
 
@@ -151,6 +210,33 @@ class Truck:
         self.moving = False
 
 
+class Tube:
+    """Ağ trafiğini gösteren, kabarcıklı sıvı dolu cam tüp."""
+    INNER = TUBE_BOT - TUBE_TOP - 1    # sıvının dolabileceği satır sayısı
+
+    def __init__(self, x, liquid, arrow):
+        self.x = x
+        self.liquid = hx(liquid)
+        self.arrow = ARROWS[arrow]
+        self.level = self.target = 0.0
+        self.bubbles = []
+
+    def set_rate(self, bps):
+        if bps <= NET_MIN:
+            self.target = 0.0
+        else:
+            self.target = min(1.0, math.log10(bps / NET_MIN) / math.log10(NET_MAX / NET_MIN))
+
+    def step(self):
+        self.level += (self.target - self.level) * 0.12
+        height = self.level * self.INNER
+        if height > 3 and random.random() < 0.08 + self.level * 0.4:
+            self.bubbles.append([random.randint(0, 3), 0.0, random.uniform(0.3, 0.6 + self.level)])
+        for b in self.bubbles:
+            b[1] += b[2]
+        self.bubbles = [b for b in self.bubbles if b[1] < height - 2]
+
+
 class World:
     def __init__(self):
         self.t = 0
@@ -165,10 +251,15 @@ class World:
                         random.uniform(0.03, 0.07)] for _ in range(3)]
         self.truck = Truck()
         self.metrics = Metrics()
+        self.tubes = [Tube(3, '#3ddc97', 'down'), Tube(12, '#ff9f43', 'up')]
         self.shop_lit = [False]
         # Sıcaklık arttıkça bu sırayla yanarlar (dükkan vitrini dahil 22 pencere)
         self.light_order = [w for h in self.houses for w in h.windows] + [self.shop_lit]
         random.Random(7).shuffle(self.light_order)
+        # Evlerin önünde kalmayan çimen tutamları
+        rng = random.Random(3)
+        self.tufts = [x for x in range(0, W, 3)
+                      if rng.random() < 0.6 and not any(h.x - 1 <= x <= h.x + h.w for h in self.houses)]
         self.truck_script = self.run_truck()
         for i in range(2):
             m = Person(self.houses[3].door_x + i * 8)
@@ -307,11 +398,16 @@ class World:
         if self.t % (FPS * 30) == 1:
             self.update_light()
         if self.t % (FPS * 2) == 1:
-            self.metrics.update()
-            frac = (self.metrics.temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
+            m = self.metrics
+            m.update()
+            frac = (m.temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
             lit = round(max(0.0, min(1.0, frac)) * len(self.light_order))
             for i, w in enumerate(self.light_order):
                 w[-1] = i < lit
+            self.tubes[0].set_rate(m.down)
+            self.tubes[1].set_rate(m.up)
+        for tube in self.tubes:
+            tube.step()
         busy = 0.3 + 0.7 * self.light
 
         next(self.truck_script)
@@ -377,6 +473,7 @@ class World:
         return (c[0] * (0.35 + 0.65 * k), c[1] * (0.4 + 0.6 * k), c[2] * (0.6 + 0.4 * k))
 
     def px(self, x, y, w, h, c, glow=False, alpha=1.0):
+        c = color(c)
         c = c if glow else self.tint(c)
         self.ctx.set_source_rgba(c[0], c[1], c[2], alpha)
         self.ctx.rectangle(int(round(x)), int(round(y)), w, h)
@@ -384,110 +481,225 @@ class World:
 
     def draw(self, ctx):
         self.ctx = ctx
+        self.draw_tubes()
+        ctx.save()
+        ctx.translate(PANEL, 0)
+        ctx.rectangle(0, 0, W, H)
+        ctx.clip()
+        self.draw_scene()
+        ctx.restore()
+
+    def draw_scene(self):
         night = self.light < 0.5
         for cx, cy, cw, _ in self.clouds:
-            white = hx('#ffffff')
-            self.px(cx, cy + 2, cw, 3, white, alpha=0.85)
-            self.px(cx + 3, cy, cw // 2, 2, white, alpha=0.85)
-            self.px(cx + cw // 2, cy + 1, cw // 3, 1, white, alpha=0.85)
+            self.px(cx, cy + 2, cw, 3, '#ffffff', alpha=0.85)
+            self.px(cx + 3, cy, cw // 2, 2, '#ffffff', alpha=0.85)
+            self.px(cx + cw // 2, cy + 1, cw // 3, 1, '#ffffff', alpha=0.85)
+            self.px(cx + 1, cy + 4, cw - 2, 1, '#d6dde6', alpha=0.85)
         for bx, by, ph in self.birds:
             up = (self.t // 3 + ph) % 2
-            dark = hx('#333333')
-            self.px(bx, by, 1, 1, dark)
-            self.px(bx - 1, by - up, 1, 1, dark)
-            self.px(bx + 1, by - up, 1, 1, dark)
+            self.px(bx, by, 1, 1, '#333333')
+            self.px(bx - 1, by - up, 1, 1, '#333333')
+            self.px(bx + 1, by - up, 1, 1, '#333333')
 
         for h in self.houses:
             self.draw_house(h, night)
         for sx, sy, age in self.smoke:
             size = 1 + age // 25
-            self.px(sx, sy, size, size, hx('#d0d0d0'), alpha=max(0.0, 0.8 - age / 90))
+            self.px(sx, sy, size, size, '#d0d0d0', alpha=max(0.0, 0.8 - age / 90))
         for i, tx in enumerate(TREES):
-            sway = round(math.sin(self.t * 0.08 + i * 1.7) * 0.6)
-            self.px(tx + 2, GROUND - 6, 2, 6, hx('#6b4423'))
-            leaf, dark = hx('#4f9a3c'), hx('#3d7a2e')
-            self.px(tx + sway, GROUND - 14, 6, 8, leaf)
-            self.px(tx - 1 + sway, GROUND - 12, 8, 4, leaf)
-            self.px(tx + 1 + sway, GROUND - 16, 4, 2, leaf)
-            self.px(tx + 3 + sway, GROUND - 10, 3, 3, dark)
+            self.draw_tree(tx, i)
 
-        self.px(0, GROUND, W, 1, hx('#7fb069'))
+        # çimen, çiçekler, kaldırım
+        self.px(0, GROUND, W, 1, '#7fb069')
+        for x in self.tufts:
+            self.px(x, GROUND - 1, 1, 1, '#5e9a4a')
         for i, fx in enumerate(range(8, 19, 2)):
-            self.px(fx, GROUND - 1, 1, 1, hx(('#e74c3c', '#f1c40f', '#e84393')[i % 3]))
-            self.px(fx, GROUND, 1, 1, hx('#2e7d32'))
-        self.px(0, GROUND + 1, W, FEET - GROUND + 1, hx('#bdb6a8'))
+            self.px(fx, GROUND - 1, 1, 1, ('#e74c3c', '#f1c40f', '#e84393')[i % 3])
+            self.px(fx, GROUND, 1, 1, '#2e7d32')
+        self.px(0, GROUND + 1, W, FEET - GROUND + 1, '#bdb6a8')
+        self.px(0, GROUND + 1, W, 1, '#cfc9bc')
         for sx in range(0, W, 8):
-            self.px(sx, GROUND + 1, 1, FEET - GROUND + 1, hx('#a9a293'))
+            self.px(sx, GROUND + 1, 1, FEET - GROUND + 1, '#a9a293')
+
+        for lx in LAMPS:
+            if night:
+                for i in range(FEET + 2 - 56):
+                    half = 1 + i // 3
+                    self.px(lx - half, 56 + i, 2 * half + 1, 1, '#ffe08a', glow=True, alpha=0.1)
 
         for p in self.people:
             if p.visible:
+                self.px(p.x, FEET, 4, 1, '#000000', alpha=0.18)
                 self.draw_person(p)
             if p.dog and p.visible:
                 self.draw_dog(p.dog, p)
 
-        self.px(0, FEET + 2, W, 1, hx('#d8d4cc'))
-        self.px(0, FEET + 3, W, H - FEET - 3, hx('#4a4a52'))
+        # bordür ve yol
+        self.px(0, FEET + 2, W, 1, '#e2ded6')
+        self.px(0, FEET + 3, W, 1, '#8c8679')
+        self.px(0, FEET + 4, W, H - FEET - 4, '#4a4a52')
         for dx in range(0, W, 10):
-            self.px(dx, 82, 6, 1, hx('#e8e1a0'))
+            self.px(dx, 82, 6, 1, '#e8e1a0')
         self.draw_truck(night)
-        for cx, _, color in self.cars:
-            self.draw_car(cx, color, night)
+        for cx, _, c in self.cars:
+            self.draw_car(cx, c, night)
         for lx in LAMPS:
-            self.px(lx, 55, 1, FEET + 2 - 55, hx('#3a3a3a'))
-            self.px(lx - 1, 54, 3, 1, hx('#3a3a3a'))
-            if night:
-                self.px(lx - 1, 55, 3, 1, hx('#ffe08a'), glow=True)
-                self.px(lx - 4, 55, 9, 10, hx('#ffe08a'), glow=True, alpha=0.08)
-                self.px(lx - 2, 55, 5, 5, hx('#ffe08a'), glow=True, alpha=0.12)
+            self.draw_lamp(lx, night)
+
+    def draw_tubes(self):
+        night = self.light < 0.5
+        wood, wood_dark = '#8a6440', '#5e4329'
+        # raf: arkadaki tahta, ayaklar ve taban
+        self.px(1, 56, PANEL - 2, 3, wood)
+        self.px(1, 58, PANEL - 2, 1, wood_dark)
+        self.px(1, 59, 1, TUBE_BOT - 58, wood_dark)
+        self.px(PANEL - 2, 59, 1, TUBE_BOT - 58, wood_dark)
+        self.px(0, TUBE_BOT + 1, PANEL, 3, wood)
+        self.px(0, TUBE_BOT + 1, PANEL, 1, '#b08a5f')
+        self.px(0, TUBE_BOT + 3, PANEL, 1, wood_dark)
+
+        edge, glass = '#c9dce8', '#e6f6ff'
+        for tube in self.tubes:
+            x, liq = tube.x, tube.liquid
+            # ok simgesi
+            for r, row in enumerate(tube.arrow):
+                for c, ch in enumerate(row):
+                    if ch == '#':
+                        self.px(x + 1 + c, 2 + r, 1, 1, liq, glow=True)
+            # mantar tıpa ve ağız
+            self.px(x + 1, TUBE_TOP - 3, 5, 3, '#a9773f')
+            self.px(x + 1, TUBE_TOP - 3, 5, 1, '#c8955a')
+            self.px(x - 1, TUBE_TOP, 9, 1, edge, alpha=0.9)
+            # cam gövde
+            body = TUBE_BOT - TUBE_TOP - 2
+            self.px(x + 1, TUBE_TOP + 1, 5, body, glass, alpha=0.18)
+            self.px(x + 2, TUBE_BOT - 1, 3, 1, glass, alpha=0.18)
+            # sıvı
+            n = round(tube.level * Tube.INNER)
+            if n > 0:
+                glow = night
+                self.px(x + 2, TUBE_BOT - 1, 3, 1, liq, glow=glow)
+                if n > 1:
+                    self.px(x + 1, TUBE_BOT - n, 5, n - 1, liq, glow=glow)
+                    self.px(x + 4, TUBE_BOT - n, 2, n - 1, shade(liq, 0.8), glow=glow)
+                    self.px(x + 1, TUBE_BOT - n, 5, 1, shade(liq, 1.3), glow=glow)
+                for bx, by, _ in tube.bubbles:
+                    self.px(x + 1 + bx, TUBE_BOT - 2 - by, 1, 1, shade(liq, 1.5), glow=True, alpha=0.8)
+                if night:
+                    self.px(x - 1, TUBE_BOT - n - 1, 9, n + 2, liq, glow=True, alpha=0.08)
+            # ölçek çizgileri (her biri 10 kat)
+            for i in range(1, 5):
+                y = TUBE_BOT - 1 - round(i / 5 * Tube.INNER)
+                self.px(x + 1, y, 2, 1, edge, alpha=0.7)
+            # cam kenarları ve parlama
+            self.px(x, TUBE_TOP + 1, 1, body, edge)
+            self.px(x + 6, TUBE_TOP + 1, 1, body, edge)
+            self.px(x + 1, TUBE_BOT - 1, 1, 1, edge)
+            self.px(x + 5, TUBE_BOT - 1, 1, 1, edge)
+            self.px(x + 2, TUBE_BOT, 3, 1, edge)
+            self.px(x + 2, TUBE_TOP + 3, 1, body - 8, '#ffffff', alpha=0.4)
 
     def draw_house(self, h, night):
         wall, roof = hx(h.wall), hx(h.roof)
         self.px(h.x, h.top, h.w, h.h, wall)
-        self.px(h.x, GROUND - 1, h.w, 1, tuple(v * 0.8 for v in wall))
+        self.px(h.x + h.w - 2, h.top, 2, h.h, shade(wall, 0.86))
+        self.px(h.x, GROUND - 2, h.w, 2, shade(wall, 0.72))
         if h.kind == 'gable':
             rows = min(10, (h.w + 4) // 2 - 1)
             for i in range(rows):
-                self.px(h.x - 2 + i, h.top - 1 - i, h.w + 4 - 2 * i, 1, roof)
+                c = roof if i % 2 else shade(roof, 0.9)
+                self.px(h.x - 2 + i, h.top - 1 - i, h.w + 4 - 2 * i, 1, c)
+                self.px(h.x - 2 + i, h.top - 1 - i, 1, 1, shade(roof, 1.25))
+            self.px(h.x - 2 + rows - 1, h.top - rows, h.w + 6 - 2 * rows, 1, shade(roof, 1.2))
+            self.px(h.x - 2, h.top, h.w + 4, 1, shade(roof, 0.65))
             if h is self.houses[0]:
-                self.px(h.x + h.w - 9, h.top - 9, 3, 6, hx('#8d4a3a'))
+                self.px(h.x + h.w - 9, h.top - 9, 3, 6, '#8d4a3a')
+                self.px(h.x + h.w - 10, h.top - 10, 5, 1, '#6e392d')
         else:
             self.px(h.x - 1, h.top - 2, h.w + 2, 2, roof)
+            self.px(h.x - 1, h.top - 2, h.w + 2, 1, shade(roof, 1.25))
+            self.px(h.x, h.top, h.w, 1, shade(wall, 0.75))
+            if h.kind == 'flat':
+                ax = h.x + h.w - 7
+                self.px(ax, h.top - 9, 1, 7, '#555555')
+                self.px(ax - 2, h.top - 7, 5, 1, '#555555')
+                self.px(ax, h.top - 10, 1, 1, '#e74c3c', glow=night)
 
         for wx, wy, lit in h.windows:
             if lit:
-                self.px(wx, wy, 5, 5, hx('#ffd36b'), glow=True)
+                if night:
+                    self.px(wx - 1, wy - 1, 7, 7, '#ffd36b', glow=True, alpha=0.18)
+                self.px(wx, wy, 5, 5, '#ffd36b', glow=True)
+                self.px(wx, wy + 3, 5, 2, '#f0b84a', glow=True)
             else:
-                self.px(wx, wy, 5, 5, hx('#2b3a55') if night else hx('#bfe3f2'))
-            frame = hx('#f5f5f5')
-            self.px(wx + 2, wy, 1, 5, frame)
-            self.px(wx, wy + 2, 5, 1, frame)
-            self.px(wx - 1, wy + 5, 7, 1, frame)
+                self.px(wx, wy, 5, 5, '#2b3a55' if night else '#bfe3f2')
+                if not night:
+                    self.px(wx, wy, 2, 2, '#e4f5fb')
+            self.px(wx + 2, wy, 1, 5, '#f5f5f5')
+            self.px(wx, wy + 2, 5, 1, '#f5f5f5')
+            self.px(wx - 1, wy + 5, 7, 1, '#f5f5f5')
+            self.px(wx - 1, wy + 6, 7, 1, shade(wall, 0.8))
 
         if h.kind == 'shop':
-            self.px(h.x + 4, h.top + 3, h.w - 8, 6, hx('#3f7f5f'))
+            self.px(h.x + 4, h.top + 3, h.w - 8, 6, '#3f7f5f')
+            self.px(h.x + 4, h.top + 8, h.w - 8, 1, '#2d5e45')
             for i in range(6):
-                self.px(h.x + 7 + i * 4, h.top + 5, 2, 2, hx('#f5f5dc'))
+                self.px(h.x + 7 + i * 4, h.top + 5, 2, 2, '#f5f5dc')
             for i in range(0, h.w, 3):
-                stripe = hx('#d9534f') if (i // 3) % 2 == 0 else hx('#f5f5f5')
+                stripe = '#d9534f' if (i // 3) % 2 == 0 else '#f5f5f5'
                 self.px(h.x + i, GROUND - 16, 3, 3, stripe)
+                self.px(h.x + i + 1, GROUND - 13, 1, 1, stripe)
             lit = self.shop_lit[0]
-            glass = hx('#ffe9a8') if lit else hx('#bfe3f2')
-            self.px(h.x + 3, GROUND - 12, h.door - 6, 9, glass, glow=lit)
+            self.px(h.x + 3, GROUND - 12, h.door - 6, 9, '#ffe9a8' if lit else '#bfe3f2', glow=lit)
+            if lit and night:
+                self.px(h.x + 2, GROUND - 13, h.door - 4, 11, '#ffe9a8', glow=True, alpha=0.15)
             for i in range(3):
-                self.px(h.x + 5 + i * 5, GROUND - 6, 3, 3, hx(('#e67e22', '#c0392b', '#27ae60')[i]))
+                self.px(h.x + 5 + i * 5, GROUND - 6, 3, 3, ('#e67e22', '#c0392b', '#27ae60')[i])
 
-        door = hx('#1e1410') if h.open else hx('#6b4226')
-        self.px(h.door_x, GROUND - 9, 5, 9, door)
+        self.px(h.door_x - 1, GROUND - 10, 7, 1, shade(wall, 0.65))
+        self.px(h.door_x, GROUND - 9, 5, 9, '#1e1410' if h.open else '#6b4226')
         if not h.open:
-            self.px(h.door_x + 3, GROUND - 5, 1, 1, hx('#e6c35c'))
+            self.px(h.door_x + 1, GROUND - 8, 3, 3, '#5a3720')
+            self.px(h.door_x + 3, GROUND - 5, 1, 1, '#e6c35c')
+        self.px(h.door_x - 1, GROUND, 7, 1, '#9e978a')
+
+    def draw_tree(self, tx, i):
+        sway = round(math.sin(self.t * 0.08 + i * 1.7) * 0.6)
+        self.px(tx - 1, GROUND - 1, 8, 1, '#000000', alpha=0.15)
+        self.px(tx + 2, GROUND - 6, 2, 6, '#6b4423')
+        self.px(tx + 3, GROUND - 6, 1, 6, '#523319')
+        leaf, dark, light = '#4f9a3c', '#3d7a2e', '#6dbb4f'
+        x = tx + sway
+        self.px(x, GROUND - 14, 6, 8, leaf)
+        self.px(x - 1, GROUND - 12, 8, 4, leaf)
+        self.px(x + 1, GROUND - 16, 4, 2, leaf)
+        self.px(x + 3, GROUND - 10, 3, 3, dark)
+        self.px(x, GROUND - 8, 6, 1, dark)
+        self.px(x + 1, GROUND - 15, 2, 1, light)
+        self.px(x, GROUND - 13, 2, 2, light)
+        self.px(x + 4, GROUND - 12, 1, 1, '#c0392b')
+
+    def draw_lamp(self, lx, night):
+        self.px(lx - 1, FEET + 1, 3, 1, '#2a2a2a')
+        self.px(lx, 55, 1, FEET + 1 - 55, '#3a3a3a')
+        self.px(lx - 2, 53, 5, 1, '#2a2a2a')
+        self.px(lx - 1, 52, 3, 1, '#2a2a2a')
+        if night:
+            self.px(lx - 1, 54, 3, 1, '#fff6c8', glow=True)
+            self.px(lx - 3, 52, 7, 5, '#ffe08a', glow=True, alpha=0.15)
+        else:
+            self.px(lx - 1, 54, 3, 1, '#d8d2b0')
 
     def draw_person(self, p):
         x, top = p.x, FEET - 8
         self.px(x, top, 4, 1, p.hair)
         self.px(x, top + 1, 4, 2, p.skin)
         self.px(x + (3 if p.dir > 0 else 0), top + 1, 1, 1, p.hair)
-        self.px(x + (2 if p.dir > 0 else 1), top + 2, 1, 1, hx('#222222'))
+        self.px(x + (0 if p.dir > 0 else 3), top + 1, 1, 1, p.hair)
+        self.px(x + (2 if p.dir > 0 else 1), top + 2, 1, 1, '#222222')
         self.px(x, top + 3, 4, 3, p.shirt)
+        self.px(x, top + 5, 4, 1, shade(p.shirt, 0.8))
         if p.walking and p.frame:
             self.px(x + 1, top + 6, 2, 2, p.pants)
         else:
@@ -496,25 +708,28 @@ class World:
         front = x + 4 if p.dir > 0 else x - 1
         if p.carry == 'box':
             bx = x + 2 if p.dir > 0 else x - 3
-            self.px(bx, top + 2, 5, 4, hx('#b07a43'))
-            self.px(bx, top + 3, 5, 1, hx('#d9b380'))
+            self.px(bx, top + 2, 5, 4, '#b07a43')
+            self.px(bx, top + 3, 5, 1, '#d9b380')
             self.px(bx + (0 if p.dir > 0 else 4), top + 4, 1, 1, p.skin)
         elif p.carry == 'bag':
-            self.px(front, top + 4, 2, 3, hx('#f5f5f5'))
+            self.px(front, top + 4, 2, 3, '#f5f5f5')
+            self.px(front, top + 4, 2, 1, '#d9534f')
         elif p.carry == 'can':
             cx = x + 4 if p.dir > 0 else x - 2
-            self.px(cx, top + 4, 2, 2, hx('#7f8c8d'))
+            self.px(cx, top + 4, 2, 2, '#7f8c8d')
             spout = cx + 2 if p.dir > 0 else cx - 1
-            self.px(spout, top + 4, 1, 1, hx('#7f8c8d'))
+            self.px(spout, top + 4, 1, 1, '#7f8c8d')
             if p.watering:
                 for i in range(3):
-                    self.px(spout, top + 5 + (self.t + i * 2) % 4, 1, 1, hx('#5dade2'))
+                    self.px(spout, top + 5 + (self.t + i * 2) % 4, 1, 1, '#5dade2')
 
     def draw_dog(self, d, owner):
         x, y = d.x, FEET - 3
+        self.px(x, FEET, 6, 1, '#000000', alpha=0.15)
         self.px(x, y, 5, 2, d.color)
         head = x + 5 if owner.dir > 0 else x - 2
         self.px(head, y - 1, 2, 2, d.color)
+        self.px(head + (1 if owner.dir > 0 else 0), y - 1, 1, 1, '#111111')
         tail = x - 1 if owner.dir > 0 else x + 5
         self.px(tail, y - (self.t // 2) % 2, 1, 1, d.color)
         legs = (0, 3) if (self.t // 2) % 2 else (1, 2)
@@ -526,33 +741,45 @@ class World:
         if t.state == 'away':
             return
         x = t.x
-        self.px(x, 68, 21, 12, hx('#e9e4d8'))
+        self.px(x, 68, 21, 12, '#e9e4d8')
+        self.px(x, 68, 21, 1, '#f7f4ec')
+        self.px(x, 79, 21, 1, '#bdb6a6')
         if t.state == 'parked':
-            self.px(x + 1, 69, 19, 10, hx('#3b3226'))
+            self.px(x + 1, 69, 19, 10, '#3b3226')
             for i in range(t.boxes):
-                self.px(x + 2 + (i % 3) * 6, 75 - (i // 3) * 4, 5, 4, hx('#b07a43'))
-                self.px(x + 2 + (i % 3) * 6, 76 - (i // 3) * 4, 5, 1, hx('#d9b380'))
+                self.px(x + 2 + (i % 3) * 6, 75 - (i // 3) * 4, 5, 4, '#b07a43')
+                self.px(x + 2 + (i % 3) * 6, 76 - (i // 3) * 4, 5, 1, '#d9b380')
         else:
-            self.px(x, 73, 21, 2, hx('#2f6db5'))
-        self.px(x + 21, 71, 9, 9, hx('#c8423a'))
-        self.px(x + 24, 72, 5, 3, hx('#bfe3f2'))
+            self.px(x, 73, 21, 2, '#2f6db5')
+        self.px(x + 21, 71, 9, 9, '#c8423a')
+        self.px(x + 21, 71, 9, 1, '#e0675e')
+        self.px(x + 24, 72, 5, 3, '#bfe3f2')
+        self.px(x + 22, 79, 9, 1, '#555555')
         if night:
-            self.px(x + 30, 77, 1, 1, hx('#fff3b0'), glow=True)
+            self.px(x + 30, 77, 1, 1, '#fff3b0', glow=True)
+            self.px(x + 31, 76, 6, 3, '#fff3b0', glow=True, alpha=0.15)
         for wx in (x + 3, x + 23):
-            self.px(wx, 80, 3, 3, hx('#1c1c1c'))
+            self.px(wx, 80, 3, 3, '#1c1c1c')
             spin = (self.t // 2) % 2 if t.moving else 1
-            self.px(wx + 2 * spin, 81, 1, 1, hx('#9e9e9e'))
+            self.px(wx + 2 * spin, 81, 1, 1, '#9e9e9e')
 
-    def draw_car(self, x, color, night):
-        self.px(x + 4, 80, 8, 3, color)
-        self.px(x + 5, 81, 6, 2, hx('#bfe3f2'))
-        self.px(x, 83, 16, 4, color)
+    def draw_car(self, x, c, night):
+        self.px(x + 4, 80, 8, 3, c)
+        self.px(x + 4, 80, 8, 1, shade(c, 1.2))
+        self.px(x + 5, 81, 6, 2, '#bfe3f2')
+        self.px(x + 8, 81, 1, 2, c)
+        self.px(x, 83, 16, 4, c)
+        self.px(x, 83, 16, 1, shade(c, 1.15))
+        self.px(x, 86, 16, 1, shade(c, 0.7))
+        self.px(x + 15, 84, 1, 1, '#c0392b', glow=night)
         for wx in (x + 2, x + 11):
-            self.px(wx, 87, 3, 3, hx('#1c1c1c'))
-            self.px(wx + 2 * ((self.t // 2) % 2), 88, 1, 1, hx('#9e9e9e'))
+            self.px(wx, 87, 3, 3, '#1c1c1c')
+            self.px(wx + 2 * ((self.t // 2) % 2), 88, 1, 1, '#9e9e9e')
         if night:
-            self.px(x, 84, 1, 1, hx('#fff3b0'), glow=True)
-            self.px(x - 6, 83, 6, 3, hx('#fff3b0'), glow=True, alpha=0.15)
+            self.px(x, 84, 1, 1, '#fff3b0', glow=True)
+            self.px(x - 6, 83, 6, 3, '#fff3b0', glow=True, alpha=0.15)
+        else:
+            self.px(x, 84, 1, 1, '#f5e6a0')
 
 
 class Window(Gtk.Window):
@@ -571,12 +798,13 @@ class Window(Gtk.Window):
         visual = self.get_screen().get_rgba_visual()
         if visual:
             self.set_visual(visual)
-        self.set_default_size(W * S, H * S)
+        width = (PANEL + W) * S
+        self.set_default_size(width, H * S)
 
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         area = monitor.get_workarea()
-        self.move(area.x + area.width - W * S - 20, area.y + area.height - H * S)
+        self.move(area.x + area.width - width - 20, area.y + area.height - H * S)
 
         self.connect('draw', self.on_draw)
         self.connect('destroy', Gtk.main_quit)
