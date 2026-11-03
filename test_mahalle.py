@@ -8,6 +8,8 @@ import hava
 import mahalle as m
 import piksel_font as pf
 import saat
+import sistem
+import takvim
 
 
 class TubeTest(unittest.TestCase):
@@ -33,7 +35,7 @@ class WorldTest(unittest.TestCase):
             w.step()
             w.draw(ctx)
         self.assertTrue(any(p.kind == 'pedestrian' for p in w.people))
-        self.assertEqual(set(w.layers), {'shelf', 'houses', 'ground', 'road', 'lamps', 'moon'})
+        self.assertLessEqual({'shelf', 'houses', 'ground', 'road', 'lamps'}, set(w.layers))
 
 
 class WeatherTest(unittest.TestCase):
@@ -78,6 +80,42 @@ class FontTest(unittest.TestCase):
     def test_clock_draws(self):
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, saat.WIDTH, saat.HEIGHT)
         saat.draw_clock(cairo.Context(surf), datetime.datetime(2026, 8, 19, 23, 59, 59), None)
+
+
+class CalendarTest(unittest.TestCase):
+    def test_events(self):
+        dt = datetime.datetime
+        self.assertEqual(takvim.event(dt(2026, 10, 29, 21)).kind, 'flags')
+        self.assertTrue(takvim.event(dt(2026, 10, 29, 21)).fireworks)
+        self.assertEqual(takvim.event(dt(2026, 11, 10, 9)).kind, 'halfmast')
+        self.assertEqual(takvim.event(dt(2026, 12, 25, 9)).text, 'YENİ YILA 7 GÜN')
+        self.assertEqual(takvim.event(dt(2026, 5, 28, 9)).kind, 'bayram')
+        self.assertEqual(takvim.event(dt(2026, 5, 14, 9), birthday=(14, 5)).kind, 'birthday')
+        self.assertIsNone(takvim.event(dt(2026, 11, 3, 9)))
+        self.assertTrue(takvim.market(dt(2026, 11, 6, 18)))
+
+    def test_sun_times_yalova(self):
+        rise, set_ = takvim.sun_times(datetime.date(2026, 6, 21))
+        self.assertEqual((rise.hour, set_.hour), (5, 20))
+
+
+class LifeTest(unittest.TestCase):
+    def test_sleep_dims_and_specials_walk(self):
+        sysm = sistem.System(music=False)
+        upd = sysm.update
+        sysm.update = lambda: (upd(), setattr(sysm, 'idle_s', 10_000))
+        w = m.World(hava.Weather(fetch=False), sysm, clock=lambda: datetime.datetime(2026, 12, 31, 23, 55))
+        for kind, run in (('simitci', w.run_simitci), ('bozaci', w.run_bozaci), ('late', w.run_late)):
+            p = m.Person()
+            p.kind, p.script = kind, run(p)
+            w.people.append(p)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, (m.PANEL + m.W) * m.S, m.H * m.S)
+        for _ in range(900):
+            w.step()
+            w.draw(cairo.Context(surf))
+        self.assertGreater(w.sleep, 0.9)
+        self.assertTrue(w.event.fireworks)
+        self.assertTrue(w.sparks or w.rockets)
 
 
 if __name__ == '__main__':

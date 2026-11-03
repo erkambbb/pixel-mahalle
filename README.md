@@ -36,6 +36,25 @@ Mahallenin havası da Yalova'yı izler:
 | Rüzgâr | Ağaçlar daha çok sallanır, baca dumanı ve yağış yana yatar |
 | 8 °C altı | Herkes bere ve atkı takar |
 
+## Saatin yanındakiler
+
+- **Göstergeler:** Saatin solunda CPU ve RAM, sağında disk ve pil için dikey LED çubuklar var. Fişe takılıyken pilin üstünde şimşek çıkar, dolarken dolum dalgası yukarı akar. En altta GB değerleri ve kalan pil süresi yazar.
+- **Çalan şarkı:** MPRIS yayınlayan her oynatıcı okunur, Firefox ya da Chrome'da açılan YouTube Music dahil. Saatte ekolayzer, kayan şarkı adı ve ilerleme çubuğu çıkar. Mahallede apartmanın üst penceresinde renkli ışık yanar, pencereden notalar uçar.
+- **Gün doğumu/batımı:** Yalova için hesaplanır (↑ ↓). O saatlerin 45 dakika öncesi ve sonrasında gökyüzü turuncu-mor renge döner.
+
+## Mahalle hayatı
+
+- **Pil tabelası:** Dükkân tabelası pil göstergesine dönüşür.
+- **Uyku:** 5 dakika klavye ve fareye dokunulmazsa (`--uyku DK`) ışıklar tek tek söner, millet evine girer, evlerden Zzz yükselir. Ağaçta baykuş belirir, çatıdaki kedi kıvrılıp uyur, saat kısılır. Dokununca hepsi uyanır.
+- **Özel günler:**
+  - 23 Nisan, 19 Mayıs, 15 Temmuz, 30 Ağustos ve 29 Ekim'de çatılarda Türk bayrağı dalgalanır. 29 Ekim akşamı havai fişek atılır.
+  - 10 Kasım'da bayraklar yarıya iner.
+  - Ramazan ve Kurban bayramlarında saçaklara fener dizilir. Tarihler `takvim.py`'deki tablodan gelir, ±1 gün tahminidir.
+  - 20 Aralık'tan itibaren yılbaşı ışıkları yanar ve saatte geri sayım çıkar. 31 Aralık gece yarısı havai fişek atılır.
+  - `--dogum-gunu GG.AA` verilirse o gün kapılara balon bağlanır.
+- **Cuma pazarı:** Cuma 17:00-23:00 arası kaldırımda meyve tezgâhı kurulur, yayalar alışverişe uğrar.
+- **Sokak hayatı:** Çatıda turuncu bir kedi gezer. Sokak kedileri geçer, köpek yaklaşınca kaçar. 07:00-11:30 arası simitçi, kasım-mart akşamları "BOZAAA" diye bağıran bozacı geçer. Gece 00:00-04:00 arası eve dönen biri kapıda anahtarını arar, girince penceresi bir süre yanar.
+
 Denemek için: `./mahalle.py --hava kar` (`acik`, `parcali`, `bulutlu`, `sis`, `cisenti`, `yagmur`, `saganak`, `kar`, `firtina`). Saati kapatmak için `--saat-yok`.
 
 ## Gereksinimler

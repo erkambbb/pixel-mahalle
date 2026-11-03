@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Masaüstünde duran, tıklanamayan küçük bir piksel mahalle."""
 import argparse
+import colorsys
 import datetime
 import functools
 import glob
@@ -25,7 +26,10 @@ gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 import hava  # noqa: E402
+import piksel_font as pf  # noqa: E402
 import saat  # noqa: E402
+import sistem  # noqa: E402
+import takvim  # noqa: E402
 
 W, H = 220, 90       # mahallenin mantıksal piksel boyutu
 PANEL = 22           # soldaki internet tüplerinin genişliği
@@ -88,6 +92,39 @@ PUDDLES = (20, 60, 116, 158, 194)             # kaldırımdaki su birikintilerin
 MOON_X, MOON_Y, MOON_R = 116, 12, 5
 SYNODIC, NEW_MOON = 29.530588853, 947182440   # ay döngüsü (gün), 6 Oca 2000 18:14 UTC yeniay
 COLD = 8                                      # bu sıcaklığın altında atkı/bere
+SLEEP_AFTER = 5 * 60                          # bu kadar sn klavye/fare boşta kalınca mahalle uyur
+STALL_X = 67                                  # Cuma pazarı tezgâhı
+FW_COLORS = ['#ff5a4f', '#ffd34d', '#3ddc97', '#5dade2', '#c9a7ff', '#ffffff', '#ff9ff3']
+DECOR_COLORS = ['#ff5a4f', '#ffd34d', '#3ddc97', '#5dade2', '#ff9ff3']
+
+# kedi çizimleri (sağa bakan, yarım piksel hücreler): # gövde, e göz
+CAT_SIT = (('....#.#', '....###', '....#e#', '#..###.', '#####..'),
+           ('....#.#', '....###', '#...#e#', '#..###.', '.####..'))
+CAT_WALK = (('......##', '#.....#e', '.######.', '.#.#..#.'),
+            ('......##', '#.....#e', '.######.', '..#..#..'))
+CAT_SLEEP = ('.####.', '######', '######')
+
+
+def _flag_white():
+    """Türk bayrağındaki ay-yıldızın yarım piksel hücreleri (bayrak 7x4.5 px)."""
+    out = []
+    for cy in range(9):
+        for cx in range(14):
+            x, y = cx * 0.5 + 0.25, cy * 0.5 + 0.25
+            outer = (x - 2.5) ** 2 + (y - 2.25) ** 2 <= 1.3 ** 2
+            inner = (x - 2.85) ** 2 + (y - 2.25) ** 2 <= 1.05 ** 2
+            star = abs(x - 4.15) + abs(y - 2.25) <= 0.5
+            if (outer and not inner) or star:
+                out.append((cx, cy))
+    return out
+
+
+FLAG_WHITE = _flag_white()
+
+
+@functools.lru_cache(maxsize=256)
+def text_cells(s):
+    return pf.layout(s)
 
 ARROWS = {
     'down': ('..#..', '..#..', '#.#.#', '.###.', '..#..'),
@@ -245,6 +282,20 @@ class Person:
         self.kind = 'pedestrian'   # 'pedestrian' | 'mover' | 'gardener'
         self.umbrella = random.choice(UMBRELLAS) if random.random() < 0.85 else None
         self.scarf = random.choice(SCARVES)
+        self.shout = 0         # bozacının 'BOZAAA' balonu
+        self.keys = False      # gece dönen anahtar arıyor
+
+
+class Cat:
+    def __init__(self, x, y, color, lo=None, hi=None):
+        self.x, self.y = float(x), y
+        self.dir = 1
+        self.color = hx(color)
+        self.lo, self.hi = lo, hi
+        self.state = 'sit'     # sit | walk | sleep
+        self.phase = random.randint(0, 90)
+        self.done = False
+        self.script = None
 
 
 class Dog:
@@ -289,8 +340,18 @@ class Tube:
 
 
 class World:
-    def __init__(self, weather=None):
+    def __init__(self, weather=None, system=None, birthday=None, sleep_after=SLEEP_AFTER, clock=None):
         self.t = 0
+        self.system = system or sistem.System(music=False)
+        self.birthday = birthday
+        self.sleep_after = sleep_after
+        self.clock = clock or datetime.datetime.now
+        self.sleep, self.asleep = 0.0, False
+        self.temp_frac = 0.0
+        self.event, self.market_on, self.twi = None, False, (None, 0.0)
+        self.forced_lit = []          # [pencere, kalan kare]: gece dönenin yaktığı ışık
+        self.notes, self.zs, self.rockets, self.sparks = [], [], [], []
+        self.cats = []
         self.light = 1.0
         self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
         self.houses = [House(d) for d in HOUSES]
@@ -338,6 +399,20 @@ class World:
         g.visible = False
         g.script = self.run_gardener(g, self.houses[0])
         self.people.append(g)
+        # müzik çalınca apartmanın en üst sağ penceresinde parti
+        self.music_win = max(self.houses[1].windows, key=lambda w: (-w[1], w[0]))
+        # çatıdaki kedi: son evin mahyasında
+        h = self.houses[4]
+        rows = min(10, (h.w + 4) // 2 - 1)
+        lo = h.x - 3 + rows
+        roof_cat = Cat(lo + 6, h.top - rows, '#e08a3c', lo, lo + h.w + 6 - 2 * rows - 4)
+        roof_cat.script = self.run_roof_cat(roof_cat)
+        self.cats.append(roof_cat)
+        self.vendor = Person()
+        self.vendor.x, self.vendor.dir = STALL_X + 4, 1
+        self.vendor.shirt = hx('#2e86de')
+        self.garland = self.garland_points()
+        self.update_life()
 
     # ---- senaryolar ----
 
@@ -378,6 +453,12 @@ class World:
     def run_mover(self, p, home):
         while True:
             t = self.truck
+            if self.sleep > 0.5:   # mahalle uyuyor: eve gir, uyan(ıl)masını bekle
+                if p.visible:
+                    yield from walk(p, home.door_x)
+                    yield from self.enter(p, home)
+                yield from wait(40)
+                continue
             if t.state == 'parked' and t.boxes > 0:
                 if not p.visible:
                     yield from self.leave(p, home)
@@ -406,7 +487,7 @@ class World:
     def run_gardener(self, p, home):
         while True:
             yield from wait(random.randint(200, 600))
-            if self.rain > 0.1 or self.snow > 0.1 or self.cover > 0.3:
+            if self.rain > 0.1 or self.snow > 0.1 or self.cover > 0.3 or self.sleep > 0.3:
                 continue   # yağmurda sulamaya gerek yok, karda bahçe uyuyor
             p.carry = 'can'
             yield from self.leave(p, home)
@@ -429,7 +510,13 @@ class World:
         else:
             p.x = -6 if left else W + 2
         r = random.random()
-        if r < 0.4 and p.dog is None:
+        if r < 0.4 and p.dog is None and self.market_on and random.random() < 0.5:
+            yield from walk(p, STALL_X + random.uniform(1, 10))   # Cuma pazarından alışveriş
+            p.dir = 1
+            yield from wait(random.randint(40, 90))
+            p.carry = 'bag'
+            yield from walk(p, exit_x)
+        elif r < 0.4 and p.dog is None:
             yield from walk(p, self.shop.door_x)
             yield from self.enter(p, self.shop)
             yield from wait(random.randint(50, 150))
@@ -448,6 +535,115 @@ class World:
                 yield from wait(random.randint(15, 50))
             yield from walk(p, exit_x)
         p.done = True
+
+    def _edge(self, p):
+        left = random.random() < 0.5
+        p.x = -6.0 if left else W + 2.0
+        return W + 6 if left else -10
+
+    def run_simitci(self, p):
+        exit_x = self._edge(p)
+        p.speed, p.carry = 0.3, 'simit'
+        yield from walk(p, random.uniform(50, 170))
+        yield from wait(random.randint(50, 100))    # satış
+        yield from walk(p, exit_x)
+        p.done = True
+
+    def run_bozaci(self, p):
+        exit_x = self._edge(p)
+        p.speed, p.carry = 0.28, 'boza'
+        stops = sorted(random.sample(range(30, W - 30, 12), 3), reverse=exit_x < 0)
+        for sx in stops:
+            yield from walk(p, sx)
+            p.shout = 40
+            yield from wait(55)
+        yield from walk(p, exit_x)
+        p.done = True
+
+    def run_late(self, p):
+        house = random.choice([h for h in self.houses if h is not self.shop and h is not self.houses[1]])
+        self._edge(p)
+        p.speed = 0.22
+        yield from walk(p, house.door_x)
+        p.dir, p.keys = 1, True
+        yield from wait(random.randint(35, 70))      # anahtar arıyor
+        p.keys = False
+        yield from self.enter(p, house)
+        if house.windows:
+            self.forced_lit.append([random.choice(house.windows), FPS * random.randint(40, 90)])
+        p.done = True
+
+    def run_roof_cat(self, c):
+        while True:
+            if self.sleep > 0.5:
+                c.state = 'sleep'
+                yield from wait(20)
+                continue
+            r = random.random()
+            if r < 0.65:
+                c.state = 'sit'
+                yield from wait(random.randint(80, 300))
+            else:
+                tx = random.uniform(c.lo, c.hi)
+                c.state = 'walk'
+                while abs(tx - c.x) > 0.3:
+                    c.dir = 1 if tx > c.x else -1
+                    c.x += c.dir * 0.25
+                    yield
+                c.x = tx
+
+    def run_street_cat(self, c):
+        exit_x = W + 6 if c.x < 0 else -10
+        c.dir = 1 if exit_x > 0 else -1
+        pause = random.uniform(40, W - 40) if random.random() < 0.5 else None
+        while (exit_x - c.x) * c.dir > 0:
+            dog_near = any(p.dog and p.visible and abs(p.dog.x - c.x) < 18 for p in self.people)
+            c.state = 'walk'
+            c.x += c.dir * (1.8 if dog_near else 0.35)   # köpek yaklaşırsa kaçar
+            if pause is not None and abs(c.x - pause) < 0.4 and not dog_near:
+                pause = None
+                c.state = 'sit'
+                yield from wait(random.randint(60, 160))
+            yield
+        c.done = True
+
+    def update_life(self):
+        """2 sn'de bir: sistem, uyku, takvim, alacakaranlık ve sokak hayatı."""
+        now = self.clock()
+        self.system.update()
+        self.asleep = self.system.idle_s > self.sleep_after
+        self.event = takvim.event(now, self.birthday)
+        self.market_on = takvim.market(now)
+        self.twi = takvim.twilight(now)
+        h = now.hour + now.minute / 60
+        kinds = {p.kind for p in self.people}
+        specials = (('simitci', 7 <= h < 11.5, 300, self.run_simitci),
+                    ('bozaci', now.month in (11, 12, 1, 2, 3) and 19 <= h < 24, 420, self.run_bozaci),
+                    ('late', h < 4, 600, self.run_late))
+        for kind, active, every, run in specials:
+            if active and kind not in kinds and random.random() < 2 / every:
+                p = Person()
+                p.kind = kind
+                p.script = run(p)
+                self.people.append(p)
+        if len(self.cats) < 2 and random.random() < 2 / 200:
+            c = Cat(-6 if random.random() < 0.5 else W + 2, FEET, random.choice(('#7f8c8d', '#2b2b2b', '#f5f5f5')))
+            c.script = self.run_street_cat(c)
+            self.cats.append(c)
+
+    def garland_points(self):
+        """Evlerin saçak hizasında sarkan ip: (x, y) noktaları, 1 px aralıklı."""
+        anchors = []
+        for h in self.houses:
+            anchors += [(h.x - 1, h.top + 1.0), (h.x + h.w, h.top + 1.0)]
+        pts = []
+        for (x1, y1), (x2, y2) in zip(anchors, anchors[1:]):
+            n = max(1, int(x2 - x1))
+            sag = min(3.0, n * 0.12)
+            for i in range(n):
+                u = i / n
+                pts.append((x1 + (x2 - x1) * u, y1 + (y2 - y1) * u + sag * 4 * u * (1 - u)))
+        return pts
 
     # ---- güncelleme ----
 
@@ -473,12 +669,19 @@ class World:
         if self.t % (FPS * 2) == 1:
             m = self.metrics
             m.update()
-            frac = (m.temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
-            lit = round(max(0.0, min(1.0, frac)) * len(self.light_order))
-            for i, w in enumerate(self.light_order):
-                w[-1] = i < lit
+            self.temp_frac = max(0.0, min(1.0, (m.temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)))
             self.tubes[0].set_rate(m.down)
             self.tubes[1].set_rate(m.up)
+            self.update_life()
+        # uyku: dalarken ışıklar tek tek söner (~1 dk), uyanınca hemen yanar
+        self.sleep += ((1.0 if self.asleep else 0.0) - self.sleep) * (0.004 if self.asleep else 0.08)
+        lit = round(self.temp_frac * len(self.light_order) * (1 - self.sleep))
+        for i, w in enumerate(self.light_order):
+            w[-1] = i < lit
+        for f in self.forced_lit:
+            f[0][-1] = True
+            f[1] -= 1
+        self.forced_lit = [f for f in self.forced_lit if f[1] > 0]
         for tube in self.tubes:
             tube.step()
         busy = 0.3 + 0.7 * self.light
@@ -491,13 +694,15 @@ class World:
                 p.done = True
             if p.walking and self.t % 2 == 0:
                 p.frame ^= 1
+            if p.shout:
+                p.shout -= 1
             if p.dog:
                 target = p.x - p.dir * 7
                 p.dog.x += max(-0.9, min(0.9, target - p.dog.x))
         self.people = [p for p in self.people if not p.done]
 
         walkers = sum(1 for p in self.people if p.kind == 'pedestrian')
-        target = round(self.metrics.cpu / 100 * MAX_WALKERS)
+        target = round(self.metrics.cpu / 100 * MAX_WALKERS * (1 - self.sleep))
         if walkers < target and random.random() < 0.05:
             p = Person()
             if self.rain > 0.3 and not p.umbrella:
@@ -513,7 +718,7 @@ class World:
         for h in self.houses:
             h.open = max(0, h.open - 1)
 
-        car_target = round(self.metrics.gpu / 100 * MAX_CARS)
+        car_target = round(self.metrics.gpu / 100 * MAX_CARS * (1 - self.sleep))
         if len(self.cars) < car_target and random.random() < 0.08 and all(c[0] < W - 22 for c in self.cars):
             self.cars.append([W + 2.0, random.uniform(1.0, 1.6), random.choice(CARS)])
         for c in self.cars:
@@ -541,6 +746,55 @@ class World:
             s[2] += 1
         self.smoke = [s for s in self.smoke if s[2] < 70]
         self.step_weather()
+        self.step_life()
+
+    def step_life(self):
+        for c in self.cats:
+            try:
+                next(c.script)
+            except StopIteration:
+                c.done = True
+        self.cats = [c for c in self.cats if not c.done]
+
+        # müzik notaları
+        if self.system.music.playing and self.t % 14 == 0:
+            wx, wy, _ = self.music_win
+            self.notes.append([wx + 1.5, wy - 1, random.uniform(-0.12, 0.12), 0, random.random()])
+        for n in self.notes:
+            n[0] += n[2] + math.sin((self.t + n[4] * 50) * 0.15) * 0.08
+            n[1] -= 0.18
+            n[3] += 1
+        self.notes = [n for n in self.notes if n[3] < 70]
+
+        # uyku: evlerden Zzz yükselir
+        if self.sleep > 0.6 and self.t % 45 == 0:
+            h = random.choice([h for h in self.houses if h is not self.shop])
+            self.zs.append([h.x + h.w * random.uniform(0.3, 0.7), h.top - 6, 0])
+        for z in self.zs:
+            z[0] += 0.08
+            z[1] -= 0.12
+            z[2] += 1
+        self.zs = [z for z in self.zs if z[2] < 100]
+
+        # havai fişek
+        if self.event and self.event.fireworks and random.random() < 0.04:
+            self.rockets.append([random.uniform(20, W - 20), float(GROUND), random.uniform(-1.6, -1.2),
+                                 random.choice(FW_COLORS), random.uniform(6, 26)])
+        for r in self.rockets:
+            r[1] += r[2]
+            if r[1] <= r[4]:
+                n = random.randint(18, 28)
+                for i in range(n):
+                    a, sp = 2 * math.pi * i / n, random.uniform(0.45, 0.8)
+                    self.sparks.append([r[0], r[1], math.cos(a) * sp, math.sin(a) * sp, 0, r[3]])
+        self.rockets = [r for r in self.rockets if r[1] > r[4]]
+        for sp in self.sparks:
+            sp[0] += sp[2]
+            sp[1] += sp[3]
+            sp[2] *= 0.97
+            sp[3] = sp[3] * 0.97 + 0.025
+            sp[4] += 1
+        self.sparks = [sp for sp in self.sparks if sp[4] < 45]
 
     def step_weather(self):
         w, k = self.weather, 0.01
@@ -669,6 +923,11 @@ class World:
         night = self.light < 0.5
         cover = round(self.cover, 1)
         self.draw_sky()
+        for x, y, vy, c, _ in self.rockets:
+            self.px(x, y, 0.5, 1.5, '#ffe9a8', glow=True)
+            self.px(x, y + 1.5, 0.5, 2, c, glow=True, alpha=0.4)
+        for x, y, _, _, age, c in self.sparks:
+            self.px(x, y, 0.5, 0.5, c, glow=True, alpha=1 - age / 45)
         for bx, by, ph in self.birds:
             up = (self.t // 3 + ph) % 2
             self.px(bx, by, 1, 1, '#333333')
@@ -678,15 +937,34 @@ class World:
         lit = tuple(w[2] for h in self.houses for w in h.windows)
         self.layer('houses', (self.light, cover, lit, self.shop_lit[0], tuple(bool(h.open) for h in self.houses)),
                    lambda: [(self.draw_house(h, night), self.draw_roof_snow(h, cover)) for h in self.houses])
+        self.draw_decor(night)
+        self.draw_battery_sign(self.shop)
+        self.draw_music_window()
+        for c in self.cats:
+            if c.y < GROUND:
+                self.draw_cat(c, night)
+        for x, y, age in self.zs:
+            self.text('Z', x, y, 0.5 if age < 40 else 0.75, '#cfd8ff',
+                      alpha=(1 - age / 100) * self.sleep)
         for sx, sy, age in self.smoke:
             size = 1 + age // 25
             self.px(sx, sy, size, size, '#d0d0d0', alpha=max(0.0, 0.8 - age / 90))
         for i, tx in enumerate(TREES):
             self.draw_tree(tx, i)
+        if self.sleep > 0.5:
+            self.draw_owl((self.sleep - 0.5) * 2)
+        for x, y, _, age, hue in self.notes:
+            c = colorsys.hsv_to_rgb((hue + self.t * 0.005) % 1, 0.45, 1)
+            self.text('♪', x, y, 0.5, c, alpha=min(1.0, (70 - age) / 25))
+        if self.market_on:
+            self.draw_stall(night)
 
         self.layer('ground', (self.light, cover), lambda: self.draw_ground(night, cover))
         self.draw_puddles()
 
+        for c in self.cats:
+            if c.y >= GROUND:
+                self.draw_cat(c, night)
         for p in self.people:
             if p.visible:
                 self.px(p.x, FEET, 4, 1, '#000000', alpha=0.18)
@@ -704,7 +982,11 @@ class World:
 
     def draw_sky(self):
         dark = max(0.0, 1 - self.light * 2)          # yıldız ve ay yalnızca gece
-        vis = dark * (1 - self.cloud) * (1 - self.fog)
+        kind, k = self.twi
+        if k > 0:
+            k = round(k * (1 - 0.6 * self.cloud), 2)
+            self.layer('twilight', (kind, k), lambda: self.draw_twilight(kind, k))
+        vis = dark * (1 - self.cloud) * (1 - self.fog) * (1 - 0.8 * k)
         if vis > 0.02:
             for x, y, ph, sp, big, c in self.stars:
                 a = vis * (0.3 + 0.35 * (1 + math.sin(self.t * sp + ph)))
@@ -835,6 +1117,163 @@ class World:
         self.px(x + 1, g - 4, 3, 0.5, '#c0392b')
         self.px(x + 2.25, g - 2.5, 0.5, 0.5, '#222222')
         self.px(x + 2.25, g - 1.5, 0.5, 0.5, '#222222')
+
+    def text(self, s, x, y, u, c, glow=True, alpha=1.0):
+        cells, _ = text_cells(s)
+        x, y = math.floor(x * 2 + 0.5) / 2, math.floor(y * 2 + 0.5) / 2   # yarım piksel ızgarasına oturt
+        for cx, cy in cells:
+            self.px(x + cx * u, y + cy * u, u, u, c, glow=glow, alpha=alpha)
+
+    def text_bubble(self, s, cx, bottom):
+        w = text_cells(s)[1] * 0.5
+        x = cx - w / 2
+        self.px(x - 1, bottom - 5, w + 2, 4.5, '#f5f5f5', glow=True, alpha=0.9)
+        self.px(cx - 0.5, bottom - 0.5, 1, 0.5, '#f5f5f5', glow=True, alpha=0.9)
+        self.text(s, x, bottom - 4.25, 0.5, '#2d3436')
+
+    def draw_twilight(self, kind, k):
+        top, mid, low = (('#1a2350', '#7a3b6e', '#ff9e5e') if kind == 'dusk'
+                         else ('#1c2a5c', '#8a4a7a', '#ffc178'))
+        for y in range(GROUND):
+            f = y / GROUND
+            c = mix(top, mid, f / 0.6) if f < 0.6 else mix(mid, low, (f - 0.6) / 0.4)
+            self.px(0, y, W, 1, c, glow=True, alpha=k * (0.12 + 0.6 * f ** 1.6))
+
+    def draw_cat(self, c, night):
+        if c.state == 'sleep':
+            rows = CAT_SLEEP
+        elif c.state == 'walk':
+            rows = CAT_WALK[(self.t // 3) % 2]
+        else:
+            rows = CAT_SIT[(self.t // 12 + c.phase) % 2]
+        w = len(rows[0])
+        blink = (self.t + c.phase) % 90 < 3
+        for r, row in enumerate(rows):
+            y = c.y - (len(rows) - r) * 0.5
+            for i, v in enumerate(row):
+                if v == '.':
+                    continue
+                x = c.x + (i if c.dir > 0 else w - 1 - i) * 0.5
+                if v == 'e' and not blink:
+                    self.px(x, y, 0.5, 0.5, '#d4ff5a' if night else '#222222', glow=night)
+                else:
+                    self.px(x, y, 0.5, 0.5, c.color)
+        if c.state == 'sleep' and self.t % 60 < 40:
+            self.text('Z', c.x + 3, c.y - 4 - (self.t % 60) * 0.03, 0.5, '#cfd8ff', alpha=0.8)
+
+    def draw_owl(self, a):
+        x, y = TREES[2] + self.tree_sway(2) + 1.5, GROUND - 16
+        self.px(x, y - 4, 3, 4, '#6d4c33', alpha=a)
+        self.px(x + 0.5, y - 2, 2, 1.5, '#a1887f', alpha=a)
+        self.px(x, y - 4.5, 0.5, 0.5, '#6d4c33', alpha=a)
+        self.px(x + 2.5, y - 4.5, 0.5, 0.5, '#6d4c33', alpha=a)
+        if (self.t % 70) >= 3:
+            self.px(x + 0.5, y - 3.5, 0.5, 0.5, '#ffd34d', glow=True, alpha=a)
+            self.px(x + 2, y - 3.5, 0.5, 0.5, '#ffd34d', glow=True, alpha=a)
+
+    def draw_music_window(self):
+        if not self.system.music.playing:
+            return
+        wx, wy, _ = self.music_win
+        beat = 0.75 + 0.25 * abs(math.sin(self.t * 0.35))
+        c = colorsys.hsv_to_rgb((self.t * 0.01) % 1, 0.55, 1)
+        self.glow(wx + 2.5, wy + 2.5, 6, c, 0.05 * beat)
+        self.px(wx, wy, 5, 5, tuple(v * beat for v in c), glow=True)
+        self.px(wx + 2.25, wy, 0.5, 5, '#f5f5f5')
+        self.px(wx, wy + 2.25, 5, 0.5, '#f5f5f5')
+
+    def draw_battery_sign(self, h):
+        """Dükkân tabelası pil göstergesi: doluluk, fişe takılıysa şimşek, dolarken akan dolum."""
+        b = self.system.battery
+        if b.level is None:
+            return
+        x0, y0 = h.x + 4, h.top + 3
+        self.px(x0, y0, h.w - 8, 5, '#3f7f5f')
+        self.px(x0 + 1, y0 + 0.5, h.w - 10, 4, '#14261d')
+        bx, by, edge = x0 + 3, y0 + 1, '#e9f5ee'
+        self.px(bx, by, 12, 0.5, edge, glow=True)
+        self.px(bx, by + 2.5, 12, 0.5, edge, glow=True)
+        self.px(bx, by, 0.5, 3, edge, glow=True)
+        self.px(bx + 11.5, by, 0.5, 3, edge, glow=True)
+        self.px(bx + 12, by + 0.75, 0.5, 1.5, edge, glow=True)
+        col = '#ff5a4f' if b.level < 20 else '#ffc857' if b.level < 50 else '#3ddc97'
+        fill = 11 * b.level / 100
+        self.px(bx + 0.5, by + 0.5, fill, 2, col, glow=True)
+        if b.charging and fill < 11:
+            extra = ((self.t // 3) % 8) / 7 * (11 - fill)
+            self.px(bx + 0.5 + fill, by + 0.5, extra, 2, col, glow=True, alpha=0.45)
+        if b.plugged and (not b.charging or (self.t // 6) % 2):
+            for cx, cy in ((2, 0), (1, 1), (0, 2), (1, 2), (2, 2), (1, 3), (0, 4)):
+                self.px(bx + 4.75 + cx * 0.5, by + 0.25 + cy * 0.5, 0.5, 0.5, '#ffe14d', glow=True)
+        self.text(str(b.level), bx + 14, by - 0.25, 0.5, edge)
+
+    def draw_decor(self, night):
+        ev = self.event
+        if not ev:
+            return
+        if ev.kind in ('flags', 'halfmast'):
+            for h in self.houses:
+                if h.kind == 'gable':
+                    rows = min(10, (h.w + 4) // 2 - 1)
+                    self.draw_flag(h.x + h.w / 2 - 0.25, h.top - rows, ev.kind == 'halfmast')
+                else:
+                    self.draw_flag(h.x + 2, h.top - 2, ev.kind == 'halfmast')
+        elif ev.kind in ('bayram', 'newyear'):
+            pts = self.garland
+            for x, y in pts[::2]:
+                self.px(x, y, 0.5, 0.5, '#5a5a5a', alpha=0.8)
+            step = 5 if ev.kind == 'bayram' else 2
+            for i, (x, y) in enumerate(pts[::step]):
+                c = DECOR_COLORS[i % len(DECOR_COLORS)]
+                if ev.kind == 'bayram':      # kâğıt fenerler
+                    self.px(x - 0.25, y, 1, 0.5, '#444444')
+                    self.px(x - 0.5, y + 0.5, 1.5, 2, c, glow=night)
+                    if night:
+                        self.px(x - 1.5, y - 0.5, 3.5, 4, c, glow=True, alpha=0.12)
+                elif (i + self.t // 5) % 3:  # yılbaşı ışıkları, kayan yanıp sönme
+                    self.px(x, y + 0.5, 0.5, 1, c, glow=True)
+                    self.px(x - 0.5, y, 1.5, 2, c, glow=True, alpha=0.2)
+        elif ev.kind == 'birthday':
+            for j, h in enumerate(self.houses):
+                base_x, base_y = h.door_x + 2.5, GROUND - 10
+                for k, dx in enumerate((-2.5, 0, 2.5)):
+                    c = DECOR_COLORS[(j + k) % len(DECOR_COLORS)]
+                    bob = math.sin(self.t * 0.08 + j + k) * 0.5
+                    bx, by = base_x + dx, base_y - 7 - (k == 1) * 2 + bob
+                    for i in range(5):
+                        u = i / 5
+                        self.px(bx + (base_x - bx) * u, by + 1.5 + (base_y - by - 1.5) * u, 0.5, 0.5, '#dddddd')
+                    self.px(bx - 1, by - 1.5, 2, 2.5, c, glow=night)
+                    self.px(bx - 0.5, by - 1, 0.5, 0.5, '#ffffff', glow=night)
+
+    def draw_flag(self, x, top, half):
+        pole = 10
+        self.px(x, top - pole, 0.5, pole, '#cfcfcf', glow=True, alpha=0.8)
+        self.px(x - 0.25, top - pole - 0.5, 1, 0.5, '#ffd34d', glow=True)
+        fy = top - pole + (4.5 if half else 0.5)
+        dys = [round(math.sin(self.t * 0.25 - cx * 0.6) * (0.4 + self.wind) * cx / 13 * 2) / 2 for cx in range(14)]
+        for cx, dy in enumerate(dys):
+            self.px(x + 0.5 + cx * 0.5, fy + dy, 0.5, 4.5, '#d40a1c', glow=True)
+        for cx, cy in FLAG_WHITE:
+            self.px(x + 0.5 + cx * 0.5, fy + dys[cx] + cy * 0.5, 0.5, 0.5, '#f2f2f2', glow=True)
+
+    def draw_stall(self, night):
+        x, g = STALL_X, FEET
+        self.draw_person(self.vendor)
+        self.px(x, g - 4, 12, 1, '#a1887f')
+        self.px(x, g - 3, 12, 3, '#6d4c41')
+        self.px(x + 1, g - 2, 10, 0.5, '#5d4037')
+        for i in range(11):
+            self.px(x + 0.5 + i, g - 5, 1, 1, ('#f39c12', '#e74c3c', '#27ae60', '#f1c40f')[i % 4])
+        self.px(x, g - 11, 0.5, 7, '#555555')
+        self.px(x + 11.5, g - 11, 0.5, 7, '#555555')
+        for i in range(7):
+            c = '#2e86de' if i % 2 else '#f5f5f5'
+            self.px(x - 1 + i * 2, g - 12.5, 2, 1.5, c)
+            self.px(x - 0.5 + i * 2, g - 11, 1, 0.5, c)
+        self.px(x + 5.75, g - 10.5, 0.5, 0.5, '#fff3b0', glow=True)
+        if night:
+            self.glow(x + 6, g - 9, 5, '#ffe08a', 0.06)
 
     def layer(self, name, key, draw, shift=True, alpha=1.0):
         """Değişmeyen katmanı bir kez yüzeye çizer, anahtar değişene kadar yüzeyi basar."""
@@ -1033,8 +1472,11 @@ class World:
             self.px(h.door_x + 3, GROUND - 5, 1, 1, '#e6c35c')
         self.px(h.door_x - 1, GROUND, 7, 1, '#9e978a')
 
+    def tree_sway(self, i):
+        return round(math.sin(self.t * (0.08 + self.wind * 0.12) + i * 1.7) * (0.6 + self.wind * 1.6))
+
     def draw_tree(self, tx, i):
-        sway = round(math.sin(self.t * (0.08 + self.wind * 0.12) + i * 1.7) * (0.6 + self.wind * 1.6))
+        sway = self.tree_sway(i)
         self.px(tx - 1, GROUND - 1, 8, 1, '#000000', alpha=0.15)
         self.px(tx + 2, GROUND - 6, 2, 6, '#6b4423')
         self.px(tx + 3, GROUND - 6, 1, 6, '#523319')
@@ -1093,6 +1535,16 @@ class World:
         elif p.carry == 'bag':
             self.px(front, top + 4, 2, 3, '#f5f5f5')
             self.px(front, top + 4, 2, 1, '#d9534f')
+        elif p.carry == 'simit':   # başında simit tablası
+            self.px(x - 2, top - 1, 8, 0.5, '#8d6e63')
+            for i in range(3):
+                self.px(x - 1.5 + i * 2.5, top - 2, 2, 1, '#c68642')
+                self.px(x - 1 + i * 2.5, top - 1.5, 1, 0.5, '#8d6e63')
+            self.px(x + (3.5 if p.dir > 0 else 0), top - 0.5, 0.5, 3.5, p.skin)
+        elif p.carry == 'boza':    # bakır güğüm
+            self.px(front, top + 3.5, 2, 3, '#b87333')
+            self.px(front + 0.5, top + 2.5, 1, 1, '#d4915a')
+            self.px(front, top + 4, 2, 0.5, '#e0a96d')
         elif p.carry == 'can':
             cx = x + 4 if p.dir > 0 else x - 2
             self.px(cx, top + 4, 2, 2, '#7f8c8d')
@@ -1101,6 +1553,10 @@ class World:
             if p.watering:
                 for i in range(3):
                     self.px(spout, top + 5 + (self.t + i * 2) % 4, 1, 1, '#5dade2')
+        if p.keys and (self.t // 4) % 2:
+            self.px(front, top + 4.5, 0.5, 0.5, '#ffe08a', glow=True)
+        if p.shout:
+            self.text_bubble('BOZAAA', x + 2, top - 3)
         temp = self.weather.temp
         if self.snow > 0.2 or self.cover > 0.3 or (temp is not None and temp < COLD):
             self.px(x, top - 0.5, 4, 1, p.scarf)                       # bere
@@ -1189,13 +1645,13 @@ class World:
 
 
 class Window(Gtk.Window):
-    def __init__(self, weather=None):
+    def __init__(self, world):
         global S
         super().__init__(title='Piksel Mahalle')
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         S = max(1, round(S / monitor.get_scale_factor()))   # HiDPI'de pencere şişmesin
-        self.world = World(weather)
+        self.world = world
         self.world.update_light()
         self.set_decorated(False)
         self.set_app_paintable(True)
@@ -1243,14 +1699,21 @@ def main():
     ap.add_argument('--day', action='store_true', help='mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
     ap.add_argument('--hava', choices=sorted(hava.FORCE), help='Yalova yerine bu havayı göster (deneme için)')
     ap.add_argument('--saat-yok', action='store_true', help='ortadaki saati gösterme')
+    ap.add_argument('--dogum-gunu', metavar='GG.AA', help='o gün mahallede balonlar, saatte kutlama')
+    ap.add_argument('--uyku', type=float, default=SLEEP_AFTER / 60, metavar='DK',
+                    help='bu kadar dakika boşta kalınca mahalle uyur (varsayılan %(default)g)')
     args = ap.parse_args()
+    birthday = None
+    if args.dogum_gunu:
+        d, m = args.dogum_gunu.split('.')
+        birthday = (int(d), int(m))
     S = max(1, args.scale)
     if args.day:
         ALWAYS_NIGHT = False
-    weather = hava.Weather(force=args.hava)
-    wins = [Window(weather)]
+    world = World(hava.Weather(force=args.hava), sistem.System(), birthday, args.uyku * 60)
+    wins = [Window(world)]
     if not args.saat_yok:
-        wins.append(saat.ClockWindow(weather))
+        wins.append(saat.ClockWindow(world))
     for win in wins:
         win.show_all()
         win.input_shape_combine_region(cairo.Region())  # tıklamalar içinden geçsin

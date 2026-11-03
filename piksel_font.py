@@ -1,4 +1,5 @@
 """5x7 piksel yazı tipi: rakamlar, büyük harfler ve Türkçe karakterler."""
+import unicodedata
 
 ASCENT, BASE, DESCENT = 3, 7, 2      # şapka/nokta satırları, gövde, çengel satırları
 HEIGHT = ASCENT + BASE + DESCENT
@@ -49,7 +50,26 @@ _G = {
     '%': '##..# ##.#. ...#. ..#.. .#... .#.## #..##',
     '°': '.#. #.# .#. ... ... ... ...',
     '·': '. . . # . . .',
+    '!': '# # # # # . #',
+    '?': '.###. #...# ....# ...#. ..#.. ..... ..#..',
+    '(': '.# #. #. #. #. #. .#',
+    ')': '#. .# .# .# .# .# #.',
+    '[': '## #. #. #. #. #. ##',
+    ']': '## .# .# .# .# .# ##',
+    '&': '.##.. #..#. #.#.. .#... #.#.# #..#. .##.#',
+    "'": '# # . . . . .',
+    '"': '#.# #.# ... ... ... ... ...',
+    '+': '..... ..#.. ..#.. ##### ..#.. ..#.. .....',
+    '=': '..... ..... ##### ..... ##### ..... .....',
+    '#': '.#.#. .#.#. ##### .#.#. ##### .#.#. .#.#.',
+    '*': '..... #.#.# .###. ##### .###. #.#.# .....',
+    '_': '..... ..... ..... ..... ..... ..... #####',
+    '↑': '..#.. .###. #.#.# ..#.. ..#.. ..#.. ..#..',
+    '↓': '..#.. ..#.. ..#.. ..#.. #.#.# .###. ..#..',
+    '♪': '..##. ..#.# ..#.. ..#.. ###.. ###.. .#...',
+    '♥': '..... .#.#. ##### ##### .###. ..#.. .....',
 }
+_ALIAS = {'—': '-', '–': '-', '’': "'", '‘': "'", '“': '"', '”': '"', '…': '.', '×': 'X', '•': '·'}
 _BASE = {'Ç': 'C', 'Ş': 'S', 'Ğ': 'G', 'Ü': 'U', 'Ö': 'O', 'İ': 'I'}
 _ABOVE = {                            # satır -3 ve -2
     'Ğ': ('#...#', '.###.'),
@@ -68,10 +88,17 @@ def tr_upper(s):
     return s.replace('i', 'İ').replace('ı', 'I').upper()
 
 
+def upper(s):
+    """Türkçe harf varsa Türkçe büyütme (i -> İ), yoksa olağan (İngilizce şarkı adları için)."""
+    return tr_upper(s) if any(c in s for c in 'çğıöşüÇĞİÖŞÜ') else s.upper()
+
+
 def glyph(ch):
     """(genişlik, [(sütun, satır), ...]); satır 0 gövdenin tepesi, eksi satırlar şapka."""
+    ch = _ALIAS.get(ch, ch)
     if ch not in _G and ch not in _BASE:
-        ch = ' '
+        base = unicodedata.normalize('NFKD', ch)[:1].upper()   # é -> E
+        ch = base if base in _G else ' '
     rows = _rows(ch)
     cells = [(c, r) for r, row in enumerate(rows) for c, v in enumerate(row) if v == '#']
     for extra, start in ((_ABOVE, -3), (_BELOW, BASE)):
@@ -80,10 +107,10 @@ def glyph(ch):
     return len(rows[0]), cells
 
 
-def layout(text, gap=1):
+def layout(text, gap=1, turkish=True):
     """Metnin tüm dolu hücreleri ve toplam genişliği (sütun)."""
     x, out = 0, []
-    for ch in tr_upper(text):
+    for ch in tr_upper(text) if turkish else upper(text):
         w, cells = glyph(ch)
         out += [(x + c, r) for c, r in cells]
         x += w + gap
