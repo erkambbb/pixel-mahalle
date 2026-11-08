@@ -1,6 +1,14 @@
 # Pixel Mahalle
 
-Masaüstünde duran, tıklanamayan küçük bir piksel mahalle. Evler, yürüyen insanlar, köpekler, arabalar ve taşınma kamyonu; mahallenin hareketi bilgisayarın CPU/GPU yüküne ve sıcaklığına göre değişir.
+Masaüstünde duran küçük bir piksel mahalle. Güneş ve müzik düğmeleri dışında hiçbir yeri tıklanmaz, tıklamalar masaüstüne geçer. Evler, yürüyen insanlar, köpekler, arabalar ve taşınma kamyonu; mahallenin hareketi bilgisayarın CPU/GPU yüküne ve sıcaklığına göre değişir.
+
+![Güneş sürüklenince mahallede gün doğar](docs/gunes.gif)
+
+| Gece (parlaklık %0) | Şafak | Gündüz (parlaklık %100) |
+|---|---|---|
+| ![Gece](docs/gece.png) | ![Şafak](docs/safak.png) | ![Gündüz](docs/gunduz.png) |
+
+![Ortadaki piksel saat](docs/saat.png)
 
 ## Mahalle neyi gösteriyor?
 
@@ -14,7 +22,7 @@ Mahalle, bilgisayarın o anki durumunu canlı olarak yansıtır. Değerler 2 san
 | 💡 Sarı yanan pencereler | **İşlemci sıcaklığı** | 40 °C'de hepsi sönük, 110 °C'de hepsi yanık |
 | 🧪 Sağdaki yeşil tüp (↓) | **İndirme hızı** | Logaritmik: boş = 1 KB/s, dolu = 100 MB/s |
 | 🧪 Sağdaki turuncu tüp (↑) | **Yükleme hızı** | Tüp üzerindeki her çizgi 10 kat artış demek |
-| 🌙 Gece ışığı | Sabit | Mahalle hep gece; `ALWAYS_NIGHT = False` yapılırsa saate göre değişir |
+| ☀️ Gökyüzündeki güneş | **Ekran parlaklığı** | En solda batmış (%0, gece), sağa gittikçe yükselir, en sağda öğle güneşi (%100). Sürükleyince parlaklık değişir |
 
 Tüplerdeki çizgiler sırasıyla 10 KB/s, 100 KB/s, 1 MB/s ve 10 MB/s'yi gösterir. Trafik arttıkça kabarcıklar da hızlanır.
 
@@ -41,9 +49,20 @@ Mahallenin havası da Yalova'yı izler:
 
 ## Saatin yanındakiler
 
-- **Göstergeler:** Saatin solunda CPU ve RAM, sağında disk ve pil için dikey LED çubuklar var. Fişe takılıyken pilin üstünde şimşek çıkar, dolarken dolum dalgası yukarı akar. En altta GB değerleri ve kalan pil süresi yazar.
-- **Çalan şarkı:** MPRIS yayınlayan her oynatıcı okunur, Firefox ya da Chrome'da açılan YouTube Music dahil. Saatte ekolayzer, kayan şarkı adı ve ilerleme çubuğu çıkar. Mahallede apartmanın üst penceresinde renkli ışık yanar, pencereden notalar uçar.
+- **Göstergeler:** Saatin solunda CPU ve GPU, sağında RAM, disk ve pil için dikey LED çubuklar var. Her çubuğun üstünde kullanım yüzdesi, sensörü olanların en üstünde sıcaklık yazar (CPU, GPU, NVMe/SATA disk, sensörlü RAM); serinken yeşil, ısındıkça sarı ve kırmızı. Fişe takılıyken pilin üstünde şimşek çıkar, dolarken dolum dalgası yukarı akar. En altta GB değerleri ve kalan pil süresi yazar.
+- **Çalan şarkı:** MPRIS yayınlayan her oynatıcı okunur, Firefox ya da Chrome'da açılan YouTube Music dahil. Saatte ekolayzer, kayan şarkı adı, ilerleme çubuğu ve önceki / oynat-duraklat / sonraki düğmeleri çıkar. Saatte tıklanabilen tek yer bu düğmeler. Duraklatılan şarkı 10 dakika daha görünür kalır, devam ettirilebilsin diye. Mahallede apartmanın üst penceresinde renkli ışık yanar, pencereden notalar uçar.
 - **Gün doğumu/batımı:** Yalova için hesaplanır (↑ ↓). O saatlerin 45 dakika öncesi ve sonrasında gökyüzü turuncu-mor renge döner.
+
+## Güneş ve parlaklık
+
+Gökyüzündeki güneş ekran parlaklığının sürgüsüdür. Üstüne gelince el imleci ve yüzde balonu çıkar.
+
+- Sağa sürükledikçe güneş çatıların ardından yükselir. Önce ufuk şafak kızıllığına boyanır, sonra gökyüzü açık maviye döner. Yıldızlar ve ay söner, lambalar kapanır, renkler aydınlanır. Gün doğarken kuşlar havalanır.
+- Sola sürükledikçe güneş kızarıp alçalır ve en solda çatıların ardına batar. Mahalle gece olur, batmış güneşten Zzz yükselir.
+- Tutunca güneş büyür ve ışınları hızlanır. Bırakınca yaylanarak yerine oturur.
+- Parlaklık tuşlarla değişirse güneş de kayarak yeni yerine gider.
+- Parlaklık root gerekmeden logind üzerinden yazılır (`/sys/class/backlight`). %0, ekran tamamen kararmasın diye donanımın en kısığına değil %5'ine denk gelir.
+- Parlaklık ayarlanamayan makinelerde güneş yalnızca mahalleyi aydınlatır. Hiç sürüklenmezse mahalle gece kalır, `--day` verilirse saate göre değişir.
 
 ## Mahalle hayatı
 
@@ -77,7 +96,7 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
 ./mahalle.py
 ```
 
-Seçenekler: `--scale N` (piksel boyutu, HiDPI'de otomatik küçülür), `--day` (saate göre gündüz/gece). Wayland'de XWayland varsa otomatik olarak X11 kullanılır, böylece pencere sağ alta yerleşir.
+Seçenekler: `--scale N` (piksel boyutu, HiDPI'de otomatik küçülür), `--day` (parlaklık ayarlanamıyorsa saate göre gündüz/gece). Wayland'de XWayland varsa otomatik olarak X11 kullanılır, böylece pencere sağ alta yerleşir.
 
 Sıcaklık sensörü bulunamazsa `/sys/class/thermal` yedek olarak denenir.
 

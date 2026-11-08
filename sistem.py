@@ -1,7 +1,10 @@
-"""Sistem okumaları: RAM, disk, pil, klavye/fare boşta süresi ve çalan müzik (MPRIS)."""
+"""Sistem okumaları: RAM, disk, pil, sıcaklıklar, ekran parlaklığı, klavye/fare boşta süresi ve çalan müzik (MPRIS)."""
 import ctypes
 import glob
+import math
+import os
 import shutil
+import sys
 import threading
 import time
 
@@ -14,6 +17,103 @@ def _read(path, default=None):
             return f.read().strip()
     except OSError:
         return default
+
+
+def _hwmon_temp(names):
+    """Adı names içinde geçen ilk hwmon aygıtının sıcaklık dosyası (yoksa None)."""
+    for d in sorted(glob.glob('/sys/class/hwmon/hwmon*')):
+        if _read(d + '/name') in names and os.path.exists(d + '/temp1_input'):
+            return d + '/temp1_input'
+    return None
+
+
+def _temp(path):
+    try:
+        return int(_read(path)) / 1000
+    except (TypeError, ValueError):
+        return None
+
+
+class Backlight:
+    """Ekran parlaklığı (0..1): /sys/class/backlight'tan okunur, root gerekmeden logind üzerinden yazılır.
+
+    0, donanımın en kısığına değil FLOOR'a denk gelir: ekran tamamen kararıp güneş kaybolmasın.
+    """
+    FLOOR = 0.05
+    HOLD = 1.5     # yazdıktan sonra bu kadar sn sysfs okunmaz, eski değer güneşi geri çekmesin
+
+    def __init__(self, root='/sys/class/backlight'):
+        self.path = self.name = None
+        self.max = self.min = 1
+        self.level = None
+        self.writable = True
+        rank = {'firmware': 0, 'platform': 1, 'raw': 2}   # systemd ile aynı öncelik
+        for d in sorted(glob.glob(root + '/*') if root else [], key=lambda d: rank.get(_read(d + '/type'), 3)):
+            try:
+                mx = int(_read(d + '/max_brightness'))
+            except (TypeError, ValueError):
+                continue
+            if mx > 0:
+                self.path, self.name, self.max = d, os.path.basename(d), mx
+                self.min = min(mx, max(1, math.ceil(mx * self.FLOOR)))
+                break
+        self._bus = None
+        self._want = self._sent = None
+        self._inflight = False
+        self._touched = 0.0
+        self.update()
+
+    @property
+    def ok(self):
+        return self.path is not None and self.writable
+
+    def update(self):
+        if not self.path or time.monotonic() - self._touched < self.HOLD:
+            return
+        try:
+            raw = int(_read(self.path + '/brightness'))
+        except (TypeError, ValueError):
+            return
+        span = self.max - self.min
+        self.level = max(0.0, min(1.0, (raw - self.min) / span)) if span > 0 else 1.0
+
+    def set(self, frac):
+        """Parlaklığı frac'a çek. Çağrılar üst üste binmez: biri yoldayken yalnızca son değer bekler."""
+        if not self.ok:
+            return
+        self.level = frac = max(0.0, min(1.0, frac))
+        self._touched = time.monotonic()
+        self._want = round(self.min + (self.max - self.min) * frac)
+        if not self._inflight and self._want != self._sent:
+            self._send()
+
+    def _send(self):
+        self._inflight, self._sent = True, self._want
+        try:
+            self._bus = self._bus or Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            self._bus.call('org.freedesktop.login1', '/org/freedesktop/login1/session/auto',
+                           'org.freedesktop.login1.Session', 'SetBrightness',
+                           GLib.Variant('(ssu)', ('backlight', self.name, self._sent)), None,
+                           Gio.DBusCallFlags.NONE, 2000, None, self._done)
+        except GLib.Error as e:
+            self._fail(e)
+
+    def _done(self, bus, res, *_):
+        self._inflight = False
+        try:
+            bus.call_finish(res)
+        except GLib.Error as e:
+            self._fail(e)
+            return
+        self._touched = time.monotonic()
+        if self._want != self._sent:
+            self._send()
+
+    def _fail(self, e):
+        self._inflight = False
+        if self.writable:
+            print(f'Parlaklık ayarlanamadı, güneş yalnızca mahalleyi aydınlatacak: {e.message}', file=sys.stderr)
+        self.writable = False
 
 
 class Battery:
@@ -92,15 +192,43 @@ class Idle:
 
 
 class Music:
-    """Çalan şarkı: MPRIS yayınlayan her oynatıcı (Firefox'ta YouTube Music dahil)."""
+    """Çalan şarkı: MPRIS yayınlayan her oynatıcı (Firefox'ta YouTube Music dahil). Duraklat/sonraki/önceki de buradan."""
+    PAUSED_SHOW = 600          # duraklatılan şarkı bu kadar sn daha saatte kalır (devam ettirilebilsin)
+    PLAYER = 'org.mpris.MediaPlayer2.Player'
 
     def __init__(self, start=True):
         self.title = self.artist = ''
-        self.playing = False
+        self.playing = self.paused = False
         self.length = 0.0          # sn
+        self.player = None         # D-Bus adı
         self._pos = (0.0, 0.0)     # (konum sn, okunduğu an)
+        self._bus = None
+        self._last_play = 0.0
+        self._hold = 0.0           # komuttan sonra kısa süre eski durumu okuma
         if start:
             threading.Thread(target=self._loop, daemon=True).start()
+
+    @property
+    def visible(self):
+        """Saatte gösterilsin mi: çalıyor ya da az önce duraklatıldı."""
+        return self.playing or (self.paused and time.monotonic() - self._last_play < self.PAUSED_SHOW)
+
+    def command(self, method):
+        """PlayPause, Next ya da Previous; sonuç beklenmez, durum hemen tahmin edilir."""
+        if not self.player:
+            return
+        try:
+            self._bus = self._bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self._bus.call(self.player, '/org/mpris/MediaPlayer2', self.PLAYER, method, None, None,
+                           Gio.DBusCallFlags.NONE, 1000, None, None)
+        except GLib.Error:
+            return
+        if method == 'PlayPause':
+            if self.playing:
+                self._pos = (self.position, time.monotonic())
+            self.playing, self.paused = not self.playing, self.playing
+            self._last_play = time.monotonic()
+            self._hold = time.monotonic() + 1.5
 
     @property
     def position(self):
@@ -116,7 +244,7 @@ class Music:
                 bus = bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
                 self._poll(bus)
             except GLib.Error:
-                self.playing = False
+                self.playing = self.paused = False
             time.sleep(1)
 
     @staticmethod
@@ -141,27 +269,36 @@ class Music:
                 continue
             rank = {'Playing': 2, 'Paused': 1}.get(props.get('PlaybackStatus'), 0)
             if best is None or rank > best[0]:
-                best = (rank, props, md)
-        if not best or best[0] < 2:
-            self.playing = False
+                best = (rank, props, md, n)
+        if time.monotonic() < self._hold:
             return
-        _, props, md = best
+        if not best or best[0] < 1:
+            self.playing = self.paused = False
+            self.player = None
+            return
+        rank, props, md, self.player = best
+        self.playing, self.paused = rank == 2, rank == 1
+        if self.playing:
+            self._last_play = time.monotonic()
         artist = md.get('xesam:artist') or ''
         self.artist = ', '.join(artist) if isinstance(artist, list) else str(artist)
         self.title = str(md.get('xesam:title'))
         self.length = (md.get('mpris:length') or 0) / 1e6
         self._pos = ((props.get('Position') or 0) / 1e6, time.monotonic())
-        self.playing = True
 
 
 class System:
-    def __init__(self, music=True):
+    def __init__(self, music=True, backlight=True):
         self.battery = Battery()
+        self.backlight = Backlight('/sys/class/backlight' if backlight else None)
         self.idle = Idle()
         self.music = Music(start=music)
         self.ram = self.disk = 0.0                 # 0..1
         self.ram_gb = self.ram_total_gb = 0.0
         self.disk_gb = self.disk_total_gb = 0.0
+        self.ram_temp = self.disk_temp = None      # °C; sensör yoksa None
+        self._ram_temp_file = _hwmon_temp(('spd5118', 'jc42'))
+        self._disk_temp_file = _hwmon_temp(('nvme', 'drivetemp'))
         self.idle_s = 0.0
         self.update()
 
@@ -179,5 +316,10 @@ class System:
             self.disk, self.disk_gb, self.disk_total_gb = du.used / du.total, du.used / 1e9, du.total / 1e9
         except OSError:
             pass
+        if self._ram_temp_file:
+            self.ram_temp = _temp(self._ram_temp_file)
+        if self._disk_temp_file:
+            self.disk_temp = _temp(self._disk_temp_file)
         self.battery.update()
+        self.backlight.update()
         self.idle_s = self.idle.seconds()

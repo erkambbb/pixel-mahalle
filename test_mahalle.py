@@ -145,5 +145,118 @@ class WideTest(unittest.TestCase):
             m.W = old
 
 
+class FakeBacklight:
+    ok, level = True, 0.0
+
+    def set(self, frac):
+        self.level = frac
+
+    def update(self):
+        pass
+
+
+class SunTest(unittest.TestCase):
+    def setUp(self):
+        self.old_w = m.W
+        m.W = 452
+        sysm = sistem.System(music=False, backlight=False)
+        sysm.backlight = FakeBacklight()
+        self.w = m.World(hava.Weather(fetch=False), sysm, clock=lambda: datetime.datetime(2026, 11, 8, 14, 0, 30))
+        self.surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, (m.PANEL + m.W) * m.S, m.H * m.S)
+
+    def tearDown(self):
+        m.W = self.old_w
+
+    def drag_to(self, x):
+        w = self.w
+        sx, sy = w.sun_xy()
+        self.assertTrue(w.sun_hit(sx, sy))
+        w.sun_grab(sx)
+        w.sun_move(x)
+        w.draw(cairo.Context(self.surf))
+        w.sun_release()
+
+    def test_drag_sets_brightness_and_daylight(self):
+        w = self.w
+        self.assertEqual(w.light, 0.0)          # parlaklık 0: gece
+        self.drag_to(m.W + 50)                  # en sağ: gündüz, parlaklık %100
+        self.assertEqual(w.system.backlight.level, 1.0)
+        for _ in range(40):
+            w.step()
+            w.draw(cairo.Context(self.surf))
+        self.assertEqual(w.light, 1.0)
+        self.assertLess(w.sun_xy()[1], m.SUN_LOW)
+        self.drag_to(-50)                       # en sol: gece, parlaklık %0
+        self.assertEqual(w.system.backlight.level, 0.0)
+        for _ in range(40):
+            w.step()
+        self.assertEqual(w.light, 0.0)
+        self.assertIn('sunhalo', w.layers)
+
+    def test_sun_follows_brightness_keys(self):
+        w = self.w
+        w.system.backlight.level = 0.7          # parlaklık tuşla değişti
+        w.update_light()
+        self.assertEqual(w.sun, 0.7)
+        self.assertGreater(w.sun_label, 0)
+        for _ in range(40):
+            w.step()
+        self.assertAlmostEqual(w.light, 0.7)
+        self.assertAlmostEqual(w.sun_u, 0.7)
+
+    def test_sun_by_tower_is_drawn(self):
+        w = self.w
+        self.drag_to(w.tower + m.TOWER_W / 2)
+        self.assertTrue(w.sun_by_tower())
+
+
+class BacklightTest(unittest.TestCase):
+    def test_floor_and_mapping(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, 'panel')
+            os.mkdir(d)
+            for name, value in (('type', 'raw'), ('max_brightness', '100'), ('brightness', '5')):
+                with open(os.path.join(d, name), 'w') as f:
+                    f.write(value)
+            bl = sistem.Backlight(root)
+            self.assertEqual((bl.name, bl.min), ('panel', 5))
+            self.assertEqual(bl.level, 0.0)     # en kısık güvenli seviye = %0
+            sent = []
+            bl._send = lambda: sent.append(bl._want)
+            bl.set(1.0)
+            self.assertEqual(sent, [100])
+            bl.set(0.0)
+            self.assertEqual(sent, [100, 5])     # ekran tamamen kararmaz
+        self.assertFalse(sistem.Backlight(None).ok)
+
+
+class ClockGaugeTest(unittest.TestCase):
+    def test_clock_with_gpu_and_temps(self):
+        w = m.World()
+        w.metrics.gpu_ok, w.metrics.gpu, w.metrics.gpu_temp = True, 55, 61.0
+        w.system.disk_temp = 38.0
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, saat.WIDTH, saat.HEIGHT)
+        saat.draw_clock(cairo.Context(surf), datetime.datetime(2026, 11, 8, 14, 7, 30), w)
+        self.assertEqual(saat._temp_color(30, 45, 85), saat.GREEN)
+
+    def test_music_buttons(self):
+        w = m.World()
+        mu = w.system.music
+        mu.title, mu.artist, mu.playing, mu.player = 'Şarkı', 'Sanatçı', True, 'org.mpris.MediaPlayer2.test'
+        sent = []
+        mu.command = sent.append
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, saat.WIDTH, saat.HEIGHT)
+        ui = {'hover': 'Next', 'flash': ('PlayPause', 0.0)}
+        saat.draw_clock(cairo.Context(surf), datetime.datetime(2026, 11, 8, 14, 7, 30), w, ui=ui)
+        self.assertEqual(set(ui['rects']), {'Previous', 'PlayPause', 'Next'})
+        mu.playing = False
+        saat.draw_clock(cairo.Context(surf), datetime.datetime(2026, 11, 8, 14, 7, 30), w, ui=ui)
+        self.assertEqual(ui['rects'], {})     # çalmıyor ve duraklatılmamış: düğme yok
+        self.assertIsInstance(cairo.Region([]), cairo.Region)
+        self.assertEqual(saat._temp_color(99, 45, 85), saat.RED)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -34,7 +34,7 @@ import takvim  # noqa: E402
 W, H = 220, 90       # mahallenin mantıksal piksel boyutu (W açılışta ekran genişliğine uzatılır)
 PANEL = 28           # sağdaki internet tüplerinin genişliği
 S = 4                # her mantıksal piksel ekranda S x S (yarım piksel detay = 2x2); HiDPI'de küçülür
-ALWAYS_NIGHT = True  # mahalle hep gece
+ALWAYS_NIGHT = True  # parlaklık ayarlanamıyorsa mahalle, güneş sürüklenene dek hep gece
 FPS = 12
 GROUND = 66          # evlerin oturduğu çizgi (çimen satırı)
 FEET = 72            # kaldırımda yürüyenlerin ayak hizası
@@ -88,6 +88,9 @@ GPU_COOL, GPU_HOT = 45, 85     # GPU bu sıcaklıklar arasında bacalar sakinden
 MAX_WALKERS = 14               # %100 CPU'da 220 px'lik sokaktaki yaya sayısı (genişlikle ölçeklenir)
 MAX_CARS = 8                   # %100 GPU'da 220 px'lik yoldaki araba sayısı
 TOWER_W, TOWER_TOP = 16, 24    # saat kulesi gövdesi: genişlik ve gövdenin üst satırı
+SUN_R = 4.5                    # güneşin yarıçapı
+SUN_LOW, SUN_HIGH = 33, 9      # güneş yolunun en soldaki (ufuk, çatıların ardı) ve en sağdaki (tepe) yüksekliği
+SUN_X0 = 12                    # güneş yolunun sol ucu; sağ ucu W - SUN_X0
 
 
 def layout(width):
@@ -184,6 +187,8 @@ class Metrics:
         self._prev = self._cpu_times()
         self._net_prev = (time.monotonic(), *self._net_bytes())
         self._temp_file = self._find_temp_file()
+        self.temp_ok = self._temp_file is not None
+        self.gpu_ok = shutil.which('nvidia-smi') is not None   # GPU kullanımı yalnızca nvidia-smi'den
         self._gpu_temp_file = None
         for d in sorted(glob.glob('/sys/class/hwmon/hwmon*')):   # NVIDIA yoksa AMD/Intel/nouveau
             try:
@@ -192,7 +197,7 @@ class Metrics:
                     break
             except OSError:
                 pass
-        if shutil.which('nvidia-smi'):
+        if self.gpu_ok:
             # nvidia-smi yavaş olabilir; GTK döngüsünü bloklamasın diye ayrı iş parçacığı
             threading.Thread(target=self._poll_gpu, daemon=True).start()
 
@@ -285,6 +290,12 @@ def moon_phase(t=None):
 def mix(a, b, k):
     a, b = color(a), color(b)
     return tuple(x + (y - x) * k for x, y in zip(a, b))
+
+
+def smooth(a, b, x):
+    """x, a'dan b'ye giderken 0'dan 1'e yumuşakça (smoothstep)."""
+    t = max(0.0, min(1.0, (x - a) / (b - a)))
+    return t * t * (3 - 2 * t)
 
 
 def wait(n):
@@ -402,7 +413,7 @@ class Tube:
 class World:
     def __init__(self, weather=None, system=None, birthday=None, sleep_after=SLEEP_AFTER, clock=None):
         self.t = 0
-        self.system = system or sistem.System(music=False)
+        self.system = system or sistem.System(music=False, backlight=False)
         self.birthday = birthday
         self.sleep_after = sleep_after
         self.clock = clock or datetime.datetime.now
@@ -412,7 +423,14 @@ class World:
         self.forced_lit = []          # [pencere, kalan kare]: gece dönenin yaktığı ışık
         self.notes, self.zs, self.rockets, self.sparks = [], [], [], []
         self.cats = []
-        self.light = 1.0
+        # güneş: sun hedef (0 gece .. 1 gündüz, ekran parlaklığı), sun_u çizildiği yer, light mahallenin ışığı
+        self.sun = self.sun_u = self.light = self._light = 0.0
+        self.sun_drag = self.sun_hover = self.sun_touched = False
+        self.sun_grab_dx = 0.0
+        self.sun_label = 0                 # parlaklık balonunun kalan karesi
+        self.sun_pop, self.sun_pop_v = 1.0, 0.0
+        self.sun_spin = 0.0
+        self.sun_zs = []                   # batmış güneşten yükselen Zzz
         self.layers = {}   # ad -> (anahtar, yüzey): değişmeyen katmanlar önbellekte
         houses, self.trees, self.lamps, self.puddles, self.tower = layout(W)
         self.ring_hour = None              # son çan çalınan saat
@@ -479,6 +497,7 @@ class World:
         self.vendor.shirt = hx('#2e86de')
         self.garland = self.garland_points()
         self.update_life()
+        self.update_light(snap=True)
 
     # ---- senaryolar ----
 
@@ -713,25 +732,98 @@ class World:
 
     # ---- güncelleme ----
 
-    def update_light(self):
-        if ALWAYS_NIGHT:
-            self.light = 0.0
-            return
-        now = datetime.datetime.now()
+    def time_light(self):
+        now = self.clock()
         h = now.hour + now.minute / 60
         if 7 <= h < 18:
-            self.light = 1.0
-        elif h >= 20.5 or h < 5.5:
-            self.light = 0.0
-        elif h < 7:
-            self.light = (h - 5.5) / 1.5
-        else:
-            self.light = 1 - (h - 18) / 2.5
+            return 1.0
+        if h >= 20.5 or h < 5.5:
+            return 0.0
+        return (h - 5.5) / 1.5 if h < 7 else 1 - (h - 18) / 2.5
+
+    def update_light(self, snap=False):
+        """Güneşin hedefi ekran parlaklığıdır; parlaklık ayarlanamıyorsa sürüklendiği yer
+        (hiç sürüklenmediyse hep gece, --day ile saate göre)."""
+        bl = self.system.backlight
+        if self.sun_drag:
+            pass
+        elif bl.ok and bl.level is not None:
+            if abs(bl.level - self.sun) > 0.02 and not snap:
+                self.sun_label = FPS * 2      # parlaklık tuşla değişti: yüzdeyi göster
+            self.sun = bl.level
+        elif not self.sun_touched:
+            self.sun = 0.0 if ALWAYS_NIGHT else self.time_light()
+        if snap:
+            self.sun_u = self.light = self._light = self.sun
+
+    # ---- güneş: sürükleyerek parlaklık ----
+
+    def sun_xy(self, u=None):
+        """Güneşin yolu: solda çatıların ardında, sağa gittikçe yükselir (yay)."""
+        u = self.sun_u if u is None else u
+        x = SUN_X0 + (W - 2 * SUN_X0) * u
+        return x, SUN_LOW - (SUN_LOW - SUN_HIGH) * math.sin(u * math.pi / 2)
+
+    def sun_by_tower(self):
+        return self.tower is not None and abs(self.sun_xy()[0] - self.tower - TOWER_W / 2) < TOWER_W / 2 + SUN_R + 2
+
+    def sun_rect(self):
+        """Tıklanabilen kare (mantıksal piksel): x, y, w, h."""
+        x, y = self.sun_xy()
+        r = SUN_R + 4
+        return x - r, y - r, 2 * r, 2 * r
+
+    def sun_hit(self, x, y):
+        rx, ry, rw, rh = self.sun_rect()
+        return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+    def sun_grab(self, x):
+        self.sun_drag = self.sun_touched = True
+        self.sun_grab_dx = x - self.sun_xy()[0]
+
+    def sun_move(self, x):
+        u = (x - self.sun_grab_dx - SUN_X0) / (W - 2 * SUN_X0)
+        self.sun = self.sun_u = max(0.0, min(1.0, u))
+        self.system.backlight.set(self.sun)
+
+    def sun_release(self):
+        self.sun_drag = False
+        self.sun_label = FPS * 2
+
+    def step_sun(self):
+        # sürüklenirken imleçte durur, değilse hedefine süzülür; mahallenin ışığı yumuşakça peşinden gelir
+        if not self.sun_drag:
+            self.sun_u += (self.sun - self.sun_u) * 0.3
+            if abs(self.sun - self.sun_u) < 0.001:
+                self.sun_u = self.sun
+        prev = self.light
+        self._light += (self.sun - self._light) * 0.15
+        if abs(self.sun - self._light) < 0.004:
+            self._light = self.sun
+        # ışık değişince önbellekteki katmanlar yeniden çizilir: geçişte 1/50'lik adımlarla ilerle
+        self.light = self._light if self._light == self.sun else round(self._light * 50) / 50
+        if prev < 0.5 <= self.light and not self.birds and self.rain < 0.05 and self.snow < 0.05:
+            y = random.uniform(10, 22)    # güneş doğunca kuşlar havalanır
+            self.birds = [[-5.0 - i * 6, y + (i % 2) * 3, i * 3] for i in range(random.randint(3, 5))]
+        # tutunca büyür, bırakınca yaylanarak yerine oturur
+        target = 1.25 if self.sun_drag else 1.1 if self.sun_hover else 1.0
+        self.sun_pop_v = (self.sun_pop_v + (target - self.sun_pop) * 0.3) * 0.62
+        self.sun_pop += self.sun_pop_v
+        self.sun_spin += 0.015 + (0.1 if self.sun_drag else 0.04 if self.sun_hover else 0.0)
+        if self.sun_label:
+            self.sun_label -= 1
+        # batmış güneş uyur
+        if self.sun_u < 0.03 and not (self.sun_drag or self.sun_hover) and self.t % 40 == 0:
+            x, y = self.sun_xy()
+            self.sun_zs.append([x + 2.5, y - 5.5, 0])
+        for z in self.sun_zs:
+            z[0] += 0.07
+            z[1] -= 0.1
+            z[2] += 1
+        self.sun_zs = [z for z in self.sun_zs if z[2] < 60]
 
     def step(self):
         self.t += 1
-        if self.t % (FPS * 30) == 1:
-            self.update_light()
         if self.t % (FPS * 2) == 1:
             m = self.metrics
             m.update()
@@ -739,6 +831,8 @@ class World:
             self.tubes[0].set_rate(m.down)
             self.tubes[1].set_rate(m.up)
             self.update_life()
+            self.update_light()
+        self.step_sun()
         # uyku: dalarken ışıklar tek tek söner (~1 dk), uyanınca hemen yanar
         self.sleep += ((1.0 if self.asleep else 0.0) - self.sleep) * (0.004 if self.asleep else 0.08)
         lit = round(self.temp_frac * len(self.light_order) * (1 - self.sleep))
@@ -1022,6 +1116,8 @@ class World:
         if self.tower:
             self.layer('tower', (self.light, cover), lambda: self.draw_tower(night, cover))
             self.draw_tower_clock(night)
+            if self.sun_by_tower():   # kulenin ardında kaybolmasın
+                self.draw_sun()
         self.draw_decor(night)
         self.draw_battery_sign(self.shop)
         self.draw_music_window()
@@ -1071,13 +1167,16 @@ class World:
         self.layer('lamps', (self.light, cover, round(self.fog, 1)),
                    lambda: [self.draw_lamp(lx, night) for lx in self.lamps])
         self.draw_weather()
+        self.draw_sun_label()
 
     def draw_sky(self):
         dark = max(0.0, 1 - self.light * 2)          # yıldız ve ay yalnızca gece
+        self.draw_daylight()
         kind, k = self.twi
-        if k > 0:
-            k = round(k * (1 - 0.6 * self.cloud), 2)
-            self.layer('twilight', (kind, k), lambda: self.draw_twilight(kind, k))
+        if k > 0:   # gerçek alacakaranlık; güneş yüksekteyse sönük
+            k = round(k * (1 - 0.6 * self.cloud) * (1 - self.light), 2)
+            if k > 0:
+                self.layer('twilight', (kind, k), lambda: self.draw_twilight(kind, k))
         vis = dark * (1 - self.cloud) * (1 - self.fog) * (1 - 0.8 * k)
         if vis > 0.02:
             for x, y, ph, sp, big, c in self.stars:
@@ -1093,6 +1192,8 @@ class World:
                 for i in range(8):
                     self.px(mx - vx * i * 0.5, my - vy * i * 0.5, 0.5, 0.5, '#ffffff', glow=True,
                             alpha=vis * (1 - i / 8) * min(1.0, life / 4))
+        if not self.sun_by_tower():
+            self.draw_sun()
         moon = dark * (1 - self.cloud * 0.85) * (1 - self.fog * 0.6)
         if moon > 0.02:
             phase = round(moon_phase(), 2)
@@ -1111,6 +1212,74 @@ class World:
             self.px(cx + 3, cy, cw // 2, 2, top, glow=lit, alpha=a)
             self.px(cx + cw // 2, cy + 1, cw // 3, 1, top, glow=lit, alpha=a)
             self.px(cx + 1, cy + 4, cw - 2, 1, bottom, glow=lit, alpha=a)
+
+    def draw_daylight(self):
+        """Güneş yükseldikçe önce ufukta şafak kızıllığı, sonra gündüzün açık mavi pusu; ikisi de yukarı doğru söner."""
+        day = round(smooth(0.2, 1.0, self.light), 2)
+        dawn = round(max(0.0, 1 - abs(self.light - 0.32) / 0.32) * (1 - 0.5 * self.cloud), 2)
+        if day > 0:
+            self.layer('daysky', day, lambda: self.sky_band(('#3d8fd6', '#8fcaf5', '#d9f0ff'), 0, 0.45 * day, 1.2))
+        if dawn > 0:
+            self.layer('dawn', dawn, lambda: self.sky_band(('#6b3f8f', '#ff6f61', '#ffc46b'), 24, 0.6 * dawn, 1.5))
+
+    def sky_band(self, stops, top, alpha, power):
+        """top'tan ufka (GROUND) üç duraklı renk geçişi; tepede saydam, ufukta alpha."""
+        a, b, c = stops
+        for i in range(2 * (GROUND - top)):
+            f = (i + 1) / (2 * (GROUND - top))
+            col = mix(a, b, f / 0.6) if f < 0.6 else mix(b, c, (f - 0.6) / 0.4)
+            self.px(0, top + i / 2, W, 0.5, col, glow=True, alpha=alpha * f ** power)
+
+    def draw_sun(self):
+        """Sürüklenebilen güneş: hale, nefes alan ışınlar; alçakta kızıl, yükseldikçe sarı-beyaz."""
+        u = self.sun_u
+        sx, sy = (round(v * 2) / 2 for v in self.sun_xy())
+        active = self.sun_drag or self.sun_hover
+        vis = max(0.5 + 0.5 * smooth(0.0, 0.18, u), 0.9 if active else 0.0)   # batmışken sönük bir kor
+        hi = smooth(0.1, 0.8, u)
+        rim, mid, core = mix('#d9412b', '#ffae2b', hi), mix('#ff7a3a', '#ffd23f', hi), mix('#ffb15c', '#fff4c2', hi)
+        self.layer('sunhalo', (sx, sy, round(vis, 2), round(hi, 2)),
+                   lambda: (self.glow(sx, sy, SUN_R + 18, mid, 0.02 * vis),
+                            self.glow(sx, sy, SUN_R + 8, core, 0.045 * vis)))
+        ctx = self.ctx
+        ctx.push_group()   # üst üste binen parçalar tek saydamlıkla basılsın
+        r = SUN_R * self.sun_pop
+        rays = max(smooth(0.04, 0.35, u), 0.6 if active else 0.0)
+        if rays > 0.02:
+            for i in range(12):
+                a, long = self.sun_spin + i * math.pi / 6, i % 2 == 0
+                n = (5 if long else 3) + round(1.5 * math.sin(self.t * 0.25 + i * 1.7))
+                for j in range(n):
+                    d = r + 1.5 + j * 0.5
+                    self.px(sx + math.cos(a) * d - 0.25, sy + math.sin(a) * d - 0.25, 0.5, 0.5,
+                            core if long else mid, glow=True, alpha=rays * (1 - j / (n + 1)))
+        for rad, c in ((r, rim), (r - 1, mid), (r - 2.25, core)):
+            n = int(rad * 2)
+            for k in range(-n, n):
+                half = round(math.sqrt(max(0.0, rad * rad - ((k + 0.5) / 2) ** 2)) * 2) / 2
+                if half:
+                    self.px(sx - half, sy + k / 2, 2 * half, 0.5, c, glow=True)
+        self.px(sx - r * 0.5, sy - r * 0.6, 1.5, 0.5, '#ffffff', glow=True, alpha=0.6 * hi)
+        ctx.pop_group_to_source()
+        ctx.paint_with_alpha(vis)
+        for x, y, age in self.sun_zs:
+            self.text('Z', x, y, 0.5, '#ffcf9e', alpha=0.8 * (1 - age / 60))
+
+    def draw_sun_label(self):
+        """Parlaklık yüzdesi: güneş tutulurken, üstüne gelince ve değiştikten sonra 2 sn."""
+        a = 1.0 if self.sun_drag or self.sun_hover else min(1.0, self.sun_label / 6)
+        if a <= 0:
+            return
+        s = f'%{round(self.sun * 100)}'
+        w = text_cells(s)[1] * 0.5
+        sx, sy = self.sun_xy()
+        if sy >= 14:   # güneşin üstünde
+            x, y = sx - w / 2, sy - 12
+        else:          # tepedeyken solunda
+            x, y = sx - SUN_R - 6 - w, sy - 1.75
+        x = max(1.0, min(W - w - 1, x))
+        self.px(x - 1, y - 1, w + 2, 5.5, '#1b1f2e', glow=True, alpha=0.8 * a)
+        self.text(s, x, y, 0.5, '#ffe9a8', alpha=a)
 
     def draw_moon(self, phase):
         """Gerçek ay evresi: aydınlık kısım, sönük kısım ve birkaç krater."""
@@ -1864,7 +2033,6 @@ class Window(Gtk.Window):
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         self.world = world
-        self.world.update_light()
         self.set_decorated(False)
         self.set_app_paintable(True)
         self.set_resizable(False)
@@ -1884,6 +2052,16 @@ class Window(Gtk.Window):
 
         self.connect('draw', self.on_draw)
         self.connect('destroy', Gtk.main_quit)
+        # güneş sürüklenir: basılınca X örtük yakalama yapar, imleç güneşten çıksa da hareketler buraya gelir
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect('button-press-event', self.on_press)
+        self.connect('motion-notify-event', self.on_motion)
+        self.connect('button-release-event', self.on_release)
+        self.connect('enter-notify-event', lambda *_: self.on_hover(True))
+        self.connect('leave-notify-event', lambda *_: self.on_hover(False))
+        self._shape = None
         GLib.timeout_add(1000 // FPS, self.tick)
 
     def tick(self):
@@ -1891,7 +2069,48 @@ class Window(Gtk.Window):
             self.world.step()
         except Exception:   # tek hata animasyonu sessizce durdurmasın
             traceback.print_exc()
+        self.update_input()
+        if self.world.t % (FPS * 3) == 1:
+            saat.keep_above_desktop(self)
         self.queue_draw()
+        return True
+
+    def update_input(self):
+        """Yalnızca güneş tıklanır; mahallenin geri kalanında tıklamalar masaüstüne geçer."""
+        x, y, w, h = (round(v * S) for v in self.world.sun_rect())
+        if (x, y, w, h) != self._shape:
+            self._shape = (x, y, w, h)
+            self.input_shape_combine_region(cairo.Region(cairo.RectangleInt(x, y, w, h)))
+
+    def set_cursor(self, name):
+        gw = self.get_window()
+        if gw:
+            gw.set_cursor(Gdk.Cursor.new_from_name(gw.get_display(), name) if name else None)
+
+    def on_hover(self, inside):
+        if not self.world.sun_drag:
+            self.world.sun_hover = inside
+            self.set_cursor('grab' if inside else None)
+
+    def on_press(self, _widget, ev):
+        if ev.button == 1 and self.world.sun_hit(ev.x / S, ev.y / S):
+            self.world.sun_grab(ev.x / S)
+            self.set_cursor('grabbing')
+        return True
+
+    def on_motion(self, _widget, ev):
+        if self.world.sun_drag:
+            self.world.sun_move(ev.x / S)
+            self.queue_draw()   # imleci 12 FPS'ten akıcı izlesin
+        return True
+
+    def on_release(self, _widget, ev):
+        if ev.button == 1 and self.world.sun_drag:
+            self.world.sun_release()
+            inside = self.world.sun_hit(ev.x / S, ev.y / S)
+            self.world.sun_hover = inside
+            self.set_cursor('grab' if inside else None)
+            self.update_input()
         return True
 
     def on_draw(self, _widget, ctx):
@@ -1908,7 +2127,8 @@ def main():
     global S, W, ALWAYS_NIGHT
     ap = argparse.ArgumentParser(description='Masaüstünde duran küçük bir piksel mahalle.')
     ap.add_argument('--scale', type=int, default=S, help='her mantıksal pikselin ekran boyutu (varsayılan %(default)s)')
-    ap.add_argument('--day', action='store_true', help='mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
+    ap.add_argument('--day', action='store_true',
+                    help='ekran parlaklığı ayarlanamıyorsa mahalle saate göre gündüz/gece olsun (varsayılan: hep gece)')
     ap.add_argument('--hava', choices=sorted(hava.FORCE), help='Yalova yerine bu havayı göster (deneme için)')
     ap.add_argument('--saat-yok', action='store_true', help='ortadaki saati gösterme')
     ap.add_argument('--dogum-gunu', metavar='GG.AA', help='o gün mahallede balonlar, saatte kutlama')
@@ -1932,7 +2152,9 @@ def main():
         wins.append(saat.ClockWindow(world))
     for win in wins:
         win.show_all()
-        win.input_shape_combine_region(cairo.Region())  # tıklamalar içinden geçsin
+    wins[0].update_input()   # mahallede yalnızca güneş, saatte yalnızca müzik düğmeleri tıklanır
+    for win in wins[1:]:
+        win.update_input()
     Gtk.main()
 
 

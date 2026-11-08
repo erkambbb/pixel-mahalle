@@ -4,7 +4,10 @@ import math
 import time
 
 import cairo
-from gi.repository import Gdk, GLib, Gtk
+import gi
+
+gi.require_version('GdkX11', '3.0')
+from gi.repository import Gdk, GdkX11, GLib, Gtk  # noqa: E402,F401  (GdkX11: pencerelere get_xid gelsin)
 
 import piksel_font as pf
 import takvim
@@ -14,9 +17,12 @@ MONTHS = ('OCAK', 'ŞUBAT', 'MART', 'NİSAN', 'MAYIS', 'HAZİRAN', 'TEMMUZ', 'A�
 DAYS = ('PAZARTESİ', 'SALI', 'ÇARŞAMBA', 'PERŞEMBE', 'CUMA', 'CUMARTESİ', 'PAZAR')
 
 TIME_U, DATE_U, INFO_U, SMALL_U = 14, 4, 3, 2     # her yazı pikselinin ekran boyutu
-WIDTH, HEIGHT = 720, 400
-TIME_Y = 28
+WIDTH, HEIGHT = 760, 420
+TIME_Y = 48
 SEGS, SEG_W, SEG_H, SEG_GAP = 14, 12, 5, 2        # dikey LED göstergeler
+GAUGE_GAP = 54                                    # göstergeler arası (merkezden merkeze)
+# sıcaklık yazısının yeşilden kırmızıya döndüğü aralıklar (°C)
+HOT = {'CPU': (45, 95), 'GPU': (45, 85), 'RAM': (40, 80), 'DİSK': (35, 70)}
 
 
 def rgb(s):
@@ -28,6 +34,16 @@ AMBER, CREAM, MIST, MUSIC = rgb('#ffc857'), rgb('#e9dfcf'), rgb('#9fb3c8'), rgb(
 GREEN, RED = rgb('#3ddc97'), rgb('#ff5a4f')
 SUN, MOON, CLOUD, DARK, DROP, SNOW = (rgb(c) for c in (
     '#ffd34d', '#f4f1de', '#c9d2dd', '#7d8796', '#5dade2', '#ffffff'))
+
+# müzik düğmeleri (7 satır): önceki, oynat, duraklat, sonraki
+BUTTONS = {
+    'Previous': ('#....#', '#...##', '#..###', '#.####', '#..###', '#...##', '#....#'),
+    'play': ('#...', '##..', '###.', '####', '###.', '##..', '#...'),
+    'pause': ('##.##',) * 7,
+    'Next': ('#....#', '##...#', '###..#', '####.#', '###..#', '##...#', '#....#'),
+}
+BTN_W, BTN_GAP = 32, 8       # düğme hücresi genişliği, yazıyla arası
+MARQUEE_W = 426 - 3 * BTN_W - BTN_GAP
 
 _CLOUD = ('....##.....', '..######...', '.#########.', '###########', '.#########.')
 _BOLT = ('..##', '.##.', '####', '.##.', '##..', '#...')
@@ -94,8 +110,13 @@ def _seg_color(i):
     return mix(GREEN, AMBER, k / 0.6) if k < 0.6 else mix(AMBER, RED, (k - 0.6) / 0.4)
 
 
-def _gauge(ctx, cx, frac, label, value, now_s, battery=None):
-    """Dikey LED gösterge; üstte değer, altta etiket. battery: (takılı, doluyor)."""
+def _temp_color(t, lo, hi):
+    k = max(0.0, min(1.0, (t - lo) / (hi - lo)))
+    return mix(GREEN, AMBER, k / 0.5) if k < 0.5 else mix(AMBER, RED, (k - 0.5) / 0.5)
+
+
+def _gauge(ctx, cx, frac, label, value, now_s, battery=None, temp=None):
+    """Dikey LED gösterge; üstte sıcaklık ve değer, altta etiket. battery: (takılı, doluyor)."""
     x = cx - SEG_W / 2
     bottom = TIME_Y + pf.BASE * TIME_U - SEG_GAP
     lit = round(max(0.0, min(1.0, frac)) * SEGS)
@@ -128,6 +149,8 @@ def _gauge(ctx, cx, frac, label, value, now_s, battery=None):
                     ctx.set_source_rgba(*SUN, 1)
                     ctx.rectangle(cx - 6 + c * 3, mid - 9 + r * 3, 3, 3)
                     ctx.fill()
+    if temp is not None and label in HOT:
+        _text(ctx, f'{round(temp)}°', cx, TIME_Y - 40, SMALL_U, _temp_color(temp, *HOT[label]), 0.9)
     _text(ctx, value, cx, TIME_Y - 20, SMALL_U, CREAM, 0.8)
     _text(ctx, label, cx, TIME_Y + pf.BASE * TIME_U + 8, SMALL_U, MIST, 0.8)
 
@@ -152,8 +175,42 @@ def _fmt_hours(h):
     return f'{h // 60}S {h % 60:02d}DK'
 
 
-def draw_clock(ctx, now, world=None, width=WIDTH):
+def keep_above_desktop(win):
+    """Masaüstü yöneticisinin (nemo vb.) tam ekran penceresi üstümüze çıkıp tıklamaları yutmasın:
+    ona bağlı (transient) pencere olunca pencere yöneticisi bizi hep onun üstünde tutar. Yalnızca X11."""
+    gw = win.get_window()
+    if not gw or not hasattr(gw, 'get_xid'):
+        return
+    screen = Gdk.Screen.get_default()
+    desk = None
+    for w in screen.get_window_stack() or []:
+        if (w.get_xid() != gw.get_xid() and w.get_type_hint() == Gdk.WindowTypeHint.DESKTOP
+                and w.get_width() * 2 >= screen.get_width() and w.get_height() * 2 >= screen.get_height()):
+            desk = w
+    if desk and desk.get_xid() != getattr(win, '_desk', None):
+        win._desk = desk.get_xid()
+        gw.set_transient_for(desk)
+
+
+def _button(ctx, kind, x, y, hover, flash):
+    """Piksel müzik düğmesi; üstüne gelince parlar, basınca bir an beyazlar."""
+    rows = BUTTONS[kind]
+    w = len(rows[0]) * INFO_U
+    x0 = x + (BTN_W - w) / 2
+    col = mix(MUSIC, CREAM, flash) if flash else MUSIC
+    if hover:
+        ctx.set_source_rgba(*MUSIC, 0.12 + 0.2 * flash)
+        ctx.rectangle(x, y - 3, BTN_W - 2, pf.BASE * INFO_U + 6)
+        ctx.fill()
+    cells = [(c, r) for r, row in enumerate(rows) for c, v in enumerate(row) if v == '#']
+    _cells(ctx, cells, x0, y, INFO_U, col, 1.0 if hover else 0.8)
+
+
+def draw_clock(ctx, now, world=None, width=WIDTH, ui=None):
+    """ui (isteğe bağlı): {'hover': düğme, 'flash': (düğme, an)}; düğme kareleri ui['rects']'e yazılır."""
     now_s = time.time()
+    ui = ui if ui is not None else {}
+    ui['rects'] = {}
     weather = world.weather if world else None
     system = world.system if world else None
     cpu = world.metrics.cpu / 100 if world else 0.0
@@ -172,15 +229,21 @@ def draw_clock(ctx, now, world=None, width=WIDTH):
         x += (w + 2) * TIME_U
     x1 = x - 2 * TIME_U
 
-    # ---- iki yanda sistem göstergeleri
+    # ---- iki yanda sistem göstergeleri: solda işlemciler, sağda bellek, disk ve pil
     if system:
-        _gauge(ctx, x0 - 92, cpu, 'CPU', f'{round(cpu * 100)}', now_s)
-        _gauge(ctx, x0 - 38, system.ram, 'RAM', f'{round(system.ram * 100)}', now_s)
-        _gauge(ctx, x1 + 38, system.disk, 'DİSK', f'{round(system.disk * 100)}', now_s)
+        m = world.metrics
+        left = [('CPU', cpu, m.temp if m.temp_ok else None)]
+        if m.gpu_ok:
+            left.append(('GPU', m.gpu / 100, m.gpu_temp))
+        right = [('RAM', system.ram, system.ram_temp), ('DİSK', system.disk, system.disk_temp)]
+        for i, (label, frac, temp) in enumerate(reversed(left)):
+            _gauge(ctx, x0 - 38 - i * GAUGE_GAP, frac, label, f'%{round(frac * 100)}', now_s, temp=temp)
+        for i, (label, frac, temp) in enumerate(right):
+            _gauge(ctx, x1 + 38 + i * GAUGE_GAP, frac, label, f'%{round(frac * 100)}', now_s, temp=temp)
         bat = system.battery
         if bat.level is not None:
-            _gauge(ctx, x1 + 92, bat.level / 100, 'ŞARJ' if bat.plugged else 'PİL', f'{bat.level}',
-                   now_s, battery=(bat.plugged, bat.charging))
+            _gauge(ctx, x1 + 38 + len(right) * GAUGE_GAP, bat.level / 100, 'ŞARJ' if bat.plugged else 'PİL',
+                   f'%{bat.level}', now_s, battery=(bat.plugged, bat.charging))
 
     # ---- saniye çubuğu: 60 nokta, her 15'te bir uzun
     y = TIME_Y + pf.BASE * TIME_U + 16
@@ -222,18 +285,26 @@ def draw_clock(ctx, now, world=None, width=WIDTH):
 
     # ---- çalan şarkı: ekolayzer + kayan yazı + ilerleme
     music = system.music if system else None
-    if music and music.playing:
+    if music and music.visible:
         eq_x = (width - 460) / 2
         for i in range(5):
             h = (math.sin(now_s * 7 + i * 1.3) + math.sin(now_s * 11.3 + i * 2.1) + 2) / 4
-            n = 1 + round(h * 6)
+            n = 1 + round(h * 6) if music.playing else 1      # duraklatınca ekolayzer yatar
             for r in range(n):
                 ctx.set_source_rgba(*MUSIC, 0.5 + 0.5 * r / 7)
                 ctx.rectangle(eq_x + i * 5, y + (pf.BASE - 1 - r) * INFO_U, 4, INFO_U - 1)
                 ctx.fill()
         name = f'{music.artist} - {music.title}' if music.artist else music.title
         tr = any(c in name for c in 'çğıöşüÇĞİÖŞÜ')
-        _marquee(ctx, name, eq_x + 34, y, INFO_U, 426, MUSIC, now_s, tr)
+        _marquee(ctx, name, eq_x + 34, y, INFO_U, MARQUEE_W, MUSIC, now_s, tr)
+        bx = eq_x + 34 + MARQUEE_W + BTN_GAP
+        flash_kind, flash_at = ui.get('flash') or (None, 0.0)
+        for i, (cmd, kind) in enumerate((('Previous', 'Previous'),
+                                         ('PlayPause', 'pause' if music.playing else 'play'), ('Next', 'Next'))):
+            x = bx + i * BTN_W
+            flash = max(0.0, 1 - (now_s - flash_at) / 0.3) if flash_kind == cmd else 0.0
+            _button(ctx, kind, x, y, ui.get('hover') == cmd, flash)
+            ui['rects'][cmd] = (round(x), round(y - 4), BTN_W - 2, pf.BASE * INFO_U + 8)
         if music.length:
             py = y + pf.BASE * INFO_U + 8
             ctx.set_source_rgba(*MUSIC, 0.15)
@@ -279,15 +350,61 @@ class ClockWindow(Gtk.Window):
         area = (display.get_primary_monitor() or display.get_monitor(0)).get_workarea()
         self.move(area.x + (area.width - WIDTH) // 2, area.y + (area.height - HEIGHT) // 2 - 60)
         self.connect('draw', self.on_draw)
+        # yalnızca müzik düğmeleri tıklanır; gerisinde tıklamalar masaüstüne geçer
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect('button-press-event', self.on_press)
+        self.connect('motion-notify-event', lambda _w, ev: self.set_hover(self.button_at(ev.x, ev.y)))
+        self.connect('leave-notify-event', lambda *_: self.set_hover(None))
+        self.ui = {'hover': None, 'flash': None, 'rects': {}}
+        self._shape = None
         self._key = None
+        self._n = 0
         GLib.timeout_add(100, self.tick)
+
+    def button_at(self, x, y):
+        for cmd, (bx, by, bw, bh) in self.ui['rects'].items():
+            if bx <= x < bx + bw and by <= y < by + bh:
+                return cmd
+        return None
+
+    def set_hover(self, cmd):
+        if cmd != self.ui['hover']:
+            self.ui['hover'] = cmd
+            gw = self.get_window()
+            if gw:
+                gw.set_cursor(Gdk.Cursor.new_from_name(gw.get_display(), 'pointer') if cmd else None)
+            self.queue_draw()
+
+    def on_press(self, _widget, ev):
+        cmd = self.button_at(ev.x, ev.y)
+        if ev.button == 1 and cmd:
+            self.world.system.music.command(cmd)
+            self.ui['flash'] = (cmd, time.time())
+            self.queue_draw()
+        return True
+
+    def update_input(self):
+        rects = tuple(self.ui['rects'].values())
+        if rects != self._shape:
+            self._shape = rects
+            self.input_shape_combine_region(cairo.Region([cairo.RectangleInt(*r) for r in rects]))
+            if not rects:
+                self.set_hover(None)
 
     def tick(self):
         w = self.world
         now = datetime.datetime.now()
-        animating = w.system.music.playing or w.system.battery.charging or 0.02 < w.sleep < 0.98
+        self._n += 1
+        if self._n % 30 == 1:
+            keep_above_desktop(self)
+        music = w.system.music
+        flash = self.ui['flash'] and time.time() - self.ui['flash'][1] < 0.4
+        animating = (music.playing or flash or w.system.battery.charging or 0.02 < w.sleep < 0.98)
+        m = w.metrics
         key = (now.second, now.microsecond < 500_000, w.weather.ok, w.weather.label,
-               w.event and w.event.text, round(w.metrics.cpu), round(w.system.ram, 2))
+               w.event and w.event.text, round(m.cpu), round(m.gpu), round(m.temp), m.gpu_temp,
+               round(w.system.ram, 2), w.system.disk_temp, music.visible, music.paused, music.title)
         if animating or key != self._key:
             self._key = key
             self.queue_draw()
@@ -300,6 +417,7 @@ class ClockWindow(Gtk.Window):
         ctx.set_operator(cairo.OPERATOR_OVER)
         ctx.set_antialias(cairo.ANTIALIAS_NONE)
         ctx.push_group()
-        draw_clock(ctx, datetime.datetime.now(), self.world)
+        draw_clock(ctx, datetime.datetime.now(), self.world, ui=self.ui)
         ctx.pop_group_to_source()
         ctx.paint_with_alpha(1 - 0.6 * self.world.sleep)   # mahalle uyurken saat de kısılır
+        self.update_input()
