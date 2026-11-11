@@ -1,15 +1,23 @@
 #!/bin/sh
 # Oturum açılışında çalıştırılır (~/.config/autostart). Çıktıyı günlüğe yazar;
-# hemen çökerse (20 sn içinde) birkaç kez yeniden dener.
+# süreç hangi nedenle kapanırsa kapansın (X hatası dahil) yeniden başlatır.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$HOME/.cache/pixel-mahalle/log.txt"
+KILIT="$HOME/.cache/pixel-mahalle/kilit"
 mkdir -p "$(dirname "$LOG")"
-for deneme in 1 2 3 4 5; do
+# Aynı anda iki örnek çalışmasın.
+exec 9>"$KILIT"
+flock -n 9 || exit 0
+while true; do
     basla=$(date +%s)
-    echo "$(date '+%F %T') başlatılıyor (deneme $deneme)" >> "$LOG"
+    echo "$(date '+%F %T') başlatılıyor" >> "$LOG"
     /usr/bin/python3 "$DIR/mahalle.py" >> "$LOG" 2>&1
     kod=$?
     echo "$(date '+%F %T') kapandı, kod $kod" >> "$LOG"
-    [ $(( $(date +%s) - basla )) -ge 20 ] && break
-    sleep 5
+    # Hemen çöküyorsa bekleme uzasın, uzun çalıştıysa hemen dön.
+    if [ $(( $(date +%s) - basla )) -ge 20 ]; then
+        sleep 3
+    else
+        sleep 10
+    fi
 done
